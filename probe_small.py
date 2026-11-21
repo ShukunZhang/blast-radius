@@ -13,6 +13,7 @@ import signal
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 
 MAX_SECONDS = 0.5
@@ -128,8 +129,8 @@ def _keep_failing(catalog: list[dict], numbers: set[int]) -> set[int]:
     return keep
 
 
-def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]) -> set[int]:
-    """Return selected with confirmed passes removed. A dead child keeps them all."""
+def run_patched(root: Path, patch_text: str, job: Callable[[], object], limit_s: float) -> object | None:
+    """Run job in a child that imports the patched tree. None when it fails or overruns."""
     import json
 
     patched = _apply(root, patch_text)
@@ -137,7 +138,7 @@ def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]
         tree = Path(folder) / "tree"
         tree.mkdir()
         _overlay(root, tree, patched)
-        result_path = Path(folder) / "keep.json"
+        result_path = Path(folder) / "result.json"
         pid = os.fork()
         if pid == 0:
             try:
@@ -148,12 +149,11 @@ def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]
                 os.chdir(tree)
                 sys.path.insert(0, str(tree))
                 os.environ["SKIP_INTEGRATION"] = "0"
-                keep = _keep_failing(catalog, selected)
-                result_path.write_text(json.dumps(sorted(keep)))
+                result_path.write_text(json.dumps(job()))
                 os._exit(0)
             except BaseException:
                 os._exit(1)
-        deadline = __import__("time").monotonic() + 8.0 + ALARM_S * len(selected)
+        deadline = __import__("time").monotonic() + limit_s
         while not os.waitpid(pid, os.WNOHANG)[0]:
             if __import__("time").monotonic() >= deadline:
                 try:
@@ -164,9 +164,18 @@ def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]
                 break
             __import__("time").sleep(0.01)
         if not result_path.exists():
-            return selected
+            return None
         try:
-            keep = set(json.loads(result_path.read_text()))
+            return json.loads(result_path.read_text())
         except (json.JSONDecodeError, OSError):
-            return selected
-        return keep & selected
+            return None
+
+
+def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]) -> set[int]:
+    """Return selected with confirmed passes removed. A dead child keeps them all."""
+    keep = run_patched(
+        root, patch_text, lambda: sorted(_keep_failing(catalog, selected)), 8.0 + ALARM_S * len(selected)
+    )
+    if not isinstance(keep, list):
+        return selected
+    return set(keep) & selected

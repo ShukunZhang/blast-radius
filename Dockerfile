@@ -12,7 +12,7 @@ RUN tar -xzf /tmp/sqlglot.tar.gz -C /opt \
 WORKDIR /app
 COPY requirements.lock /tmp/requirements.lock
 RUN pip install --no-cache-dir 'duckdb==2.0.0' 'pandas==3.1.1'
-COPY selector.py analyze.py diffutil.py edits.py pack.py probe_small.py uncovered.py helper_edits.py class_users.py class_reads.py startup_cache.py /app/
+COPY selector.py analyze.py diffutil.py edits.py pack.py probe_small.py uncovered.py helper_edits.py class_users.py class_reads.py startup_cache.py tpc_proof.py tpc_fingerprint.py /app/
 COPY maps /app/maps
 
 ENV SQLGLOT_ROOT=/opt/sqlglot \

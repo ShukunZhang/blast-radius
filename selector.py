@@ -41,6 +41,7 @@ from helper_edits import changed_helper_names, dependent_files
 from pack import pack
 import startup_cache
 from probe_small import confirm, should_probe
+from tpc_proof import TpcProof
 from uncovered import UncoveredTests
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -49,6 +50,7 @@ COVERAGE_MAP = Path(os.environ.get("COVERAGE_MAP", "/app/maps/coverage.bin"))
 READS_MAP = Path(os.environ.get("READS_MAP", "/app/maps/reads.json"))
 CLASSES_MAP = Path(os.environ.get("CLASSES_MAP", "/app/maps/classes.json"))
 STARTUP_CACHE = Path(os.environ.get("STARTUP_CACHE", "/app/startup.pickle"))
+TPC_MAP = Path(os.environ.get("TPC_MAP", Path(__file__).resolve().parent / "maps" / "tpc.json"))
 # A reference line executed by this many tests is a shared helper, not a signal
 # that those tests depend on the particular class attribute that changed.
 HOT_REFERENCE = 40
@@ -595,6 +597,14 @@ def drop_slow_if_companions_pass(
 MAX_COMPANIONS = 8
 
 
+def schedule_cost(numbers: set[int], seconds: dict[int, float]) -> float:
+    """Simulated seconds of running `numbers`: the busiest worker plus 2 s per worker."""
+    workers = [worker for worker in pack(numbers, seconds) if worker]
+    if not workers:
+        return 0.0
+    return max(sum(seconds[number] for number in worker) for worker in workers) + 2.0 * len(workers)
+
+
 def main() -> None:
     if sys.argv[1:] == ["--prepare"]:
         startup_cache.write(STARTUP_CACHE, ROOT)
@@ -610,10 +620,13 @@ def main() -> None:
         for test in catalog
         if test["file"] in {"tests/test_optimizer.py", "tests/test_executor.py"}
     }
+    by_number = {test["number"]: test for test in catalog}
+    tpc = TpcProof(TPC_MAP, ROOT)
     commits = sorted((DATA / "commits").glob("*.patch"))
     for patch in commits:
         text = patch.read_text(encoding="utf-8")
         selected = selector.choose(text)
+        selected = tpc.drop_passing(text, selected, by_number, lambda chosen: schedule_cost(chosen, seconds))
         selected = drop_slow_if_companions_pass(text, catalog, selected, seconds, heavy)
         if should_probe(selected, seconds, text, heavy):
             selected = confirm(ROOT, text, catalog, selected)
