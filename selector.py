@@ -274,15 +274,10 @@ class Selector:
             statement = statement_at(tree, line)
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 return self.importers_of(path) | tests_touching(self.coverage, path)
-            # Coverage can record a different line of the same function than the
-            # one the patch edits. The whole function is the set that still
-            # contained every sample failure.
+            # An and/or is only observed by tests that entered that expression.
             boolop = tightest([node for node in ast.walk(tree) if isinstance(node, ast.BoolOp)], line)
             if boolop is not None:
                 owners = tests_on_lines(self.coverage, path, boolop.lineno, _end(boolop))
-                # A failing test can execute the function while coverage records a
-                # different line of the same expression. Keep the whole function.
-                owners |= tests_on_lines(self.coverage, path, _start(function), _end(function))
                 if owners:
                     return owners
             if narrow:
