@@ -14,14 +14,15 @@ from __future__ import annotations
 import enum
 import hashlib
 import pickle
-from collections.abc import Callable
+import time
+from pathlib import Path
 from typing import Any
 
 
 _LINKS = ("dependencies", "dependents")
 
 
-def _expr(value: Any, parent: Any, seen: dict[int, int]) -> Any:
+def _expr(value: Any, parent: Any, seen: dict[Any, Any]) -> Any:
     """An expression with every attribute the executor relies on, tree links checked by identity."""
     from sqlglot import exp
 
@@ -48,23 +49,27 @@ def _expr(value: Any, parent: Any, seen: dict[int, int]) -> Any:
     )
 
 
-def _step(value: Any, seen: dict[int, int]) -> Any:
+def _shallow(step: Any, seen: dict[Any, Any]) -> tuple[str, str]:
+    """A step's name and its fields other than its links, rendered once per digest."""
+    key = ("shallow", id(step))
+    if key not in seen:
+        fields = {name: item for name, item in vars(step).items() if name not in _LINKS}
+        seen[key] = (str(step.name), repr(_canon(fields, {})))
+    return seen[key]
+
+
+def _step(value: Any, seen: dict[Any, Any]) -> Any:
     """A plan step numbered in a traversal ordered by name and shallow content, so set order is irrelevant."""
     if id(value) in seen:
         return ("step", seen[id(value)])
-    seen[id(value)] = len(seen)
-    fields = {key: item for key, item in vars(value).items() if key not in _LINKS}
-    shallow = _canon(fields, {})
-
-    def order(step: Any) -> tuple[str, str]:
-        return (str(step.name), repr(_canon({k: v for k, v in vars(step).items() if k not in _LINKS}, {})))
-
-    dependencies = [_step(step, seen) for step in sorted(value.dependencies, key=order)]
-    dependents = sorted(repr(order(step)) for step in value.dependents)
-    return ("Step", type(value).__qualname__, shallow, dependencies, dependents)
+    seen[id(value)] = seen.get("next", 0)
+    seen["next"] = seen[id(value)] + 1
+    dependencies = [_step(step, seen) for step in sorted(value.dependencies, key=lambda step: _shallow(step, seen))]
+    dependents = sorted(repr(_shallow(step, seen)) for step in value.dependents)
+    return ("Step", type(value).__qualname__, _shallow(value, seen)[1], dependencies, dependents)
 
 
-def _canon(value: Any, seen: dict[int, int]) -> Any:
+def _canon(value: Any, seen: dict[Any, Any]) -> Any:
     """A deterministic, structural rendering: sets are sorted and plan steps numbered once."""
     from sqlglot import exp
     from sqlglot.planner import Step
@@ -130,20 +135,69 @@ def _plan(schema: dict, received: Any) -> str:
     )
 
 
-def _worker(suite: str) -> Callable[[Any, dict], Any]:
-    """The test's mp_execute, after its setUpClass and with the tables shipped as its pool initializer ships them."""
+SKIP, CHECK, EXECUTE = 0, 1, 2
+_SUITES = ("tpch", "tpcds")
+
+
+def _loaded_rows() -> dict[str, dict[str, list]]:
+    """The rows TestExecutor.setUpClass reads from the CSV files, per suite and table."""
     import tests.test_executor as module
 
-    if not _LOADED:
-        module.TestExecutor.setUpClass()
-        _LOADED.append(module)
-    tables = module.TestExecutor.tpch_tables if suite == "tpch" else module.TestExecutor.tpcds_tables
-    schema = module.TPCH_SCHEMA if suite == "tpch" else module.TPCDS_SCHEMA
-    module.initializer(*pickle.loads(pickle.dumps((schema, tables))))
-    return module.mp_execute
+    module.TestExecutor.setUpClass()
+    found = {"tpch": module.TestExecutor.tpch_tables, "tpcds": module.TestExecutor.tpcds_tables}
+    return {suite: {name: table.rows for name, table in found[suite].items()} for suite in _SUITES}
 
 
-_LOADED: list[Any] = []
+def write_tables(path: Path) -> None:
+    """Pickle the loaded rows per table, so a probe needs neither pandas, DuckDB nor the CSV files."""
+    rows = _loaded_rows()
+    blobs = {suite: {name: pickle.dumps(found, protocol=5) for name, found in rows[suite].items()} for suite in _SUITES}
+    path.write_bytes(pickle.dumps(blobs, protocol=5))
+
+
+class _Tables:
+    """The worker's tables: built from the loaded rows as setUpClass builds them, then shipped through pickle
+    as the pool initializer ships them, one table at a time and once each."""
+
+    def __init__(self, path: Path | None, suite: str, schema: dict) -> None:
+        self._path, self._suite = path, suite
+        self._loaded: dict[str, bytes] | None = None
+        self.schema = pickle.loads(pickle.dumps(schema))
+        self._source = schema
+        self._shipped: dict[str, Any] = {}
+
+    @property
+    def _blobs(self) -> dict[str, bytes]:
+        if self._loaded is None:
+            if self._path is not None and self._path.exists():
+                self._loaded = pickle.loads(self._path.read_bytes())[self._suite]
+            else:
+                self._loaded = {name: pickle.dumps(found) for name, found in _loaded_rows()[self._suite].items()}
+        return self._loaded
+
+    def get(self, name: str) -> Any:
+        from sqlglot.executor.table import Table
+
+        if name not in self._shipped:
+            built = Table(columns=self._source[name], rows=pickle.loads(self._blobs[name]))
+            self._shipped[name] = pickle.loads(pickle.dumps(built))
+        return self._shipped[name]
+
+    def ship_all(self) -> None:
+        """Build and ship every table, as setUpClass and the pool initializer do."""
+        for name in self._blobs:
+            self.get(name)
+
+
+def _execute(tables: _Tables, received: Any) -> Any:
+    """The test's mp_execute, in a worker whose initializer received the schema and the tables."""
+    from sqlglot import find_tables
+    from sqlglot.executor import execute
+
+    chosen = {}
+    for table in find_tables(received):
+        chosen[table.name] = tables.get(table.name)
+    return execute(received, schema=tables.schema, tables=chosen)
 
 
 def _result(table: Any) -> str:
@@ -151,57 +205,64 @@ def _result(table: Any) -> str:
     return _sha((list(received.columns), [list(row) for row in received.rows]))
 
 
-def record(suite: str) -> list[dict[str, str] | None]:
-    """Per query: None when the test only ships it, else digests of its DuckDB SQL, its plan and its result."""
+def record(suite: str) -> list[dict[str, Any] | None]:
+    """Per query: None when the test only ships it, else digests of its DuckDB SQL, plan and result, and their CPU."""
     from sqlglot import transpile
 
     schema, pairs = _parts(suite)
-    entries: list[dict[str, str] | None] = []
-    worker = _worker(suite)
+    tables = _Tables(None, suite, schema)
+    entries: list[dict[str, Any] | None] = []
     for meta, sql in pairs:
         received = _received(sql)
         if not meta.get("execute"):
             entries.append(None)
             continue
-        entries.append(
-            {
-                "transpile": _sha(transpile(sql, write="duckdb")),
-                "plan": _plan(schema, _received(sql)),
-                "result": _result(worker(received, meta)),
-            }
-        )
+        start = time.process_time()
+        entry: dict[str, Any] = {"transpile": _sha(transpile(sql, write="duckdb")), "plan": _plan(schema, _received(sql))}
+        middle = time.process_time()
+        entry["result"] = _result(_execute(tables, received))
+        entry["check_s"], entry["execute_s"] = round(middle - start, 3), round(time.process_time() - middle, 3)
+        entries.append(entry)
     return entries
 
 
-def replay(suite: str, expected: list[dict[str, str | None] | None], unreached: bool) -> bool:
+def replay(suite: str, expected: list, actions: list[int], full: bool, tables_path: Path | None) -> bool:
     """Whether the patched tree leaves the test passing, as on the pinned commit; stops at the first doubt.
 
-    Every query must parse and cross pickle, and each executed one must give
-    DuckDB the same SQL. Its result must then match the pinned one: taken as
-    given when `unreached` (no edit reaches code the test runs after planning)
-    and the plan digests the same, else by executing it.
+    Queries whose action is SKIP run no edited code. Every other query must
+    parse and cross pickle, and an executed one must give DuckDB the same SQL.
+    Its result must then match the pinned one: taken as given for CHECK when
+    its plan digests the same, else by executing it. `full` also rebuilds and
+    ships every table, for edits to code setUpClass or the initializer runs.
     """
-    from sqlglot import transpile
-
     try:
+        import sqlglot.errors
+        import sqlglot.executor
+        import sqlglot.executor.python
+        import sqlglot.executor.table
+        import sqlglot.optimizer
+        import sqlglot.planner  # noqa: F401 - the modules the test imports, whose import must not fail
+        from sqlglot import transpile
+
         schema, pairs = _parts(suite)
-        if len(pairs) != len(expected):
+        if not len(pairs) == len(expected) == len(actions):
             return False
-        worker = None if unreached else _worker(suite)
-        for (meta, sql), entry in zip(pairs, expected):
-            received = _received(sql)
+        tables = _Tables(tables_path, suite, schema)
+        if full:
+            tables.ship_all()
+        for (meta, sql), entry, action in zip(pairs, expected, actions):
+            if action == SKIP:
+                continue
             if bool(meta.get("execute")) != (entry is not None):
                 return False
+            received = _received(sql)
             if entry is None:
                 continue
             if _sha(transpile(sql, write="duckdb")) != entry["transpile"]:
                 return False
-            if unreached and _plan(schema, _received(sql)) == entry["plan"]:
+            if action == CHECK and _plan(schema, _received(sql)) == entry["plan"]:
                 continue
-            if entry["result"] is None:
-                return False
-            worker = worker or _worker(suite)
-            if _result(worker(received, meta)) != entry["result"]:
+            if entry["result"] is None or _result(_execute(tables, received)) != entry["result"]:
                 return False
         return True
     except Exception:  # noqa: BLE001 - any failure leaves the test selected

@@ -297,17 +297,32 @@ def _stable(first: list, second: list, suite: str) -> list[dict[str, str | None]
     return merged
 
 
-def _child(kind: str, root: Path, suite: str) -> object:
+def _child(kind: str, root: Path, suite: str, seed: str = "random") -> object:
     command = [sys.executable, "-B", __file__, "--child", kind, str(root), suite]
-    return json.loads(subprocess.run(command, check=True, capture_output=True, text=True).stdout)
+    environment = {**os.environ, "PYTHONHASHSEED": seed}
+    return json.loads(subprocess.run(command, check=True, capture_output=True, text=True, env=environment).stdout)
+
+
+def _child_main(kind: str, root: Path, suite: str) -> object:
+    if kind == "runtime":
+        return _run_one(root, suite)
+    if kind == "lines":
+        sys.path.insert(1, str(HERE))
+        import tpc_queries
+
+        return tpc_queries.record_lines(root, suite)
+    return _record(root, suite)
+
+
+SEEDS = ("1", "2", "3")
 
 
 def main() -> None:
     if sys.argv[1] == "--child":
-        kind, root, suite = sys.argv[2], Path(sys.argv[3]), sys.argv[4]
-        found = _run_one(root, suite) if kind == "runtime" else _record(root, suite)
-        sys.stdout.write(json.dumps(found))
+        sys.stdout.write(json.dumps(_child_main(sys.argv[2], Path(sys.argv[3]), sys.argv[4])))
         return
+    import tpc_queries
+
     root, out = Path(sys.argv[1]).resolve(), Path(sys.argv[2])
     built = {}
     for suite in TESTS:
@@ -317,7 +332,13 @@ def main() -> None:
             path: sorted(set(ran["after"].get(path, [])) | set(ran["imported"].get(path, [])))
             for path in sorted(set(ran["after"]) | set(ran["imported"]))
         }
-        built[suite] = {"digests": digests, "runtime": runtime, "names": _names(root, runtime, set(ran["after"]))}
+        queries = tpc_queries.merge([_child("lines", root, suite, seed) for seed in SEEDS] + [{"plan": {}, "run": {}, "shared": ran["imported"]}])
+        built[suite] = {
+            "digests": digests,
+            "runtime": runtime,
+            "names": _names(root, runtime, set(ran["after"])),
+            "queries": queries,
+        }
         unknown = sum(1 for entry in digests if entry is not None and entry["result"] is None)
         print(suite, len(digests), "unstable results", unknown, sum(map(len, runtime.values())), file=sys.stderr)
     out.write_text(json.dumps(built, separators=(",", ":")), encoding="utf-8")

@@ -41,7 +41,7 @@ from helper_edits import changed_helper_names, dependent_files
 from pack import pack
 import startup_cache
 from probe_small import confirm, should_probe
-from tpc_proof import TpcProof
+from tpc_proof import TpcProof, prepare_tables
 from uncovered import UncoveredTests
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -608,6 +608,7 @@ def schedule_cost(numbers: set[int], seconds: dict[int, float]) -> float:
 def main() -> None:
     if sys.argv[1:] == ["--prepare"]:
         startup_cache.write(STARTUP_CACHE, ROOT)
+        prepare_tables(ROOT)
         return
     catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     numbers = {test["id"]: test["number"] for test in catalog}

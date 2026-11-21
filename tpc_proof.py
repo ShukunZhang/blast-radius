@@ -3,45 +3,61 @@
 Both tests compare DuckDB with sqlglot's Python executor on fixture queries.
 maps/tpc.json holds, from the pinned commit where they pass, digests per
 executed query of its DuckDB SQL, its plan and its result (tpc_fingerprint),
-the sqlglot lines run after planning or by functions at import, and the names
-those lines read. When the patch edits no such function and binds no such
-name, a query whose plan digests as pinned keeps its pinned result; any other
-executed query is run in the probe and its result compared.
+the lines each query runs while planned and while executed (tpc_queries),
+the lines every query shares, and the names the post-planning code reads.
+tpc_edits maps the patch onto those lines; the probe then skips queries that
+run no edited line, checks the plan of those that run one only while being
+planned, and executes the rest, comparing results with the pinned ones.
 """
 
 from __future__ import annotations
 
 import ast
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
-from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
+from diffutil import DiffApplyError, FileDiff, apply_hunks, parse_patch
 from probe_small import run_patched
+from tpc_edits import FULL, PLAN_ALL, Reach, file_reach
+from tpc_fingerprint import CHECK, EXECUTE, SKIP
 
 TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch",
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds",
 }
-# Measured CPU of a probe (starting the child and importing sqlglot included): checking digests when no
-# edit reaches the code run after planning, and executing every query when one does.
-PROBE_CPU_S = {"tpch": 0.35, "tpcds": 4.4}
-REPLAY_CPU_S = {"tpch": 2.0, "tpcds": 11.2}
-# Patches that reach the code run after planning break these tests about half the time, and a probe that
-# finds the break still costs a few seconds, so dropping must save this much more to be worth a replay.
-REPLAY_RISK_S = 5.0
+TPC_TABLES = Path(os.environ.get("TPC_TABLES", "/app/tpc_tables.pickle"))
+# Measured CPU of a probe: forking and importing sqlglot; loading, building and shipping the tables a query
+# reads, or all of them; parsing a query the test only ships. Per-query plan and run CPU come from the map.
+PROBE_BASE_S = 0.25
+TABLES_S = 0.35
+ALL_TABLES_S = 1.0
+PARSE_S = 0.01
+# A probe that executes queries finds a break about half the time, after spending part of its estimate.
+EXECUTE_RISK = 0.3
 PROBE_LIMIT_S = 60.0
 _GUARDED_TESTS = {"tests/test_executor.py", "tests/helpers.py", "tests/__init__.py", "tests/conftest.py"}
 _INERT_SUFFIXES = (".md", ".rst", ".txt")
-BLOCKED, REACHED, UNREACHED = "blocked", "reached", "unreached"
+
+
+@dataclass
+class Plan:
+    actions: list[int]
+    full: bool
+    needs_probe: bool
+    cpu_s: float
 
 
 class TpcProof:
     def __init__(self, path: Path, root: Path) -> None:
         self.root = root
         self.suites: dict[str, dict] = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        self._trees: dict[str, ast.Module] = {}
+        self._shared: dict[str, dict[str, set[int]]] = {}
 
     def drop_passing(
         self, patch_text: str, selected: set[int], tests: dict[int, dict], cost: Callable[[set[int]], float]
@@ -51,186 +67,129 @@ class TpcProof:
             number: TESTS[tests[number]["id"]] for number in selected if tests[number]["id"] in TESTS
         }
         candidates = {number: suite for number, suite in candidates.items() if suite in self.suites}
-        if not candidates or cost(selected) - cost(selected - set(candidates)) <= min(PROBE_CPU_S.values()):
+        if not candidates or cost(selected) - cost(selected - set(candidates)) <= PROBE_BASE_S:
             return selected
         files = parse_patch(patch_text)
-        reach = {suite: self._reach(files, suite) for suite in set(candidates.values())}
-        chosen = _most_saving(candidates, reach, selected, cost)
+        plans = {suite: self._plan(files, suite) for suite in set(candidates.values())}
+        chosen = _most_saving(candidates, plans, selected, cost)
         if not chosen:
             return selected
-        expected = {suite: (self.suites[suite]["digests"], reach[suite] == UNREACHED) for suite in chosen.values()}
-        proven = run_patched(self.root, patch_text, lambda: _passing(expected), PROBE_LIMIT_S)
-        if not isinstance(proven, list):
-            return selected
+        probing = {suite: plans[suite] for suite in set(chosen.values()) if plans[suite].needs_probe}  # type: ignore[union-attr]
+        proven = set(chosen.values()) - set(probing)
+        if probing:
+            expected = {suite: (self.suites[suite]["digests"], plan.actions, plan.full) for suite, plan in probing.items()}
+            found = run_patched(self.root, patch_text, lambda: _passing(expected), PROBE_LIMIT_S)
+            if isinstance(found, list):
+                proven |= set(found) & set(probing)
         return selected - {number for number, suite in chosen.items() if suite in proven}
 
-    def _reach(self, files: list[FileDiff], suite: str) -> str:
-        """BLOCKED when the probe cannot stand in for the test, else whether an edit reaches code it runs after planning."""
-        runtime = {path: set(lines) for path, lines in self.suites[suite]["runtime"].items()}
-        names = set(self.suites[suite]["names"])
-        reach = UNREACHED
+    def _plan(self, files: list[FileDiff], suite: str) -> Plan | None:
+        """What the probe must do per query for the test to count as passing; None when it cannot stand in."""
+        data = self.suites[suite]
+        digests: list = data["digests"]
+        names = set(data["names"])
+        full = plan_all = needs_probe = False
+        plan_mask = run_mask = 0
         for file_diff in files:
             path = file_diff.path or ""
             if file_diff.binary or (file_diff.old_path is not None and file_diff.new_path != file_diff.old_path):
-                return BLOCKED
+                return None
             if not path.startswith("sqlglot/"):
                 if path in _GUARDED_TESTS or path.startswith("tests/fixtures/optimizer/tpc-"):
-                    return BLOCKED
+                    return None
                 if not (path.startswith("tests/") or path.endswith(_INERT_SUFFIXES)):
-                    return BLOCKED
+                    return None
                 continue
             if file_diff.old_path is None:
                 continue
-            if not path.endswith(".py") or path.startswith("sqlglot/executor/"):
-                reach = REACHED
-            elif reach == UNREACHED and not self._file_unreached(file_diff, runtime, names):
-                reach = REACHED
-        return reach
+            reach = self._file_reach(file_diff, names) if path.endswith(".py") else None
+            if reach is None:
+                full = needs_probe = True
+                continue
+            needs_probe |= reach.needs_probe
+            full |= reach.level == FULL
+            plan_all |= reach.level == PLAN_ALL
+            shared = self._shared_lines(suite).get(path, set())
+            plan_lines = data["queries"]["plan"].get(path, {})
+            run_lines = data["queries"]["run"].get(path, {})
+            for start, end in reach.spans:
+                for line in range(start, end + 1):
+                    full |= line in shared
+                    plan_mask |= plan_lines.get(str(line), 0)
+                    run_mask |= run_lines.get(str(line), 0)
+        actions = []
+        for index, entry in enumerate(digests):
+            if full or (run_mask >> index) & 1:
+                actions.append(EXECUTE if entry is not None else CHECK)
+            elif plan_all or ((plan_mask >> index) & 1):
+                actions.append(CHECK)
+            else:
+                actions.append(SKIP)
+        needs_probe |= any(action != SKIP for action in actions)
+        return Plan(actions, full, needs_probe, _estimate(actions, full, digests) if needs_probe else 0.0)
 
-    def _file_unreached(self, file_diff: FileDiff, runtime: dict[str, set[int]], names: set[str]) -> bool:
+    def _file_reach(self, file_diff: FileDiff, names: set[str]) -> Reach | None:
         path = file_diff.old_path or ""
         try:
             old_text = (self.root / path).read_text(encoding="utf-8")
-            new_tree = ast.parse(apply_hunks(old_text, file_diff.hunks))
-        except (OSError, SyntaxError, DiffApplyError):
-            return False
-        old_tree = self._tree(path, old_text)
-        ran = runtime.get(path, set())
-        old_functions = _functions(old_tree)
-        for line, _text in removed_lines(file_diff.hunks):
-            if not _edit_unreached(_chain(old_tree, line), line, old_functions, ran, names):
-                return False
-        for line, _text in added_lines(file_diff.hunks):
-            if not _edit_unreached(_chain(new_tree, line), line, old_functions, ran, names):
-                return False
-        return True
+            return file_reach(ast.parse(old_text), ast.parse(apply_hunks(old_text, file_diff.hunks)), file_diff.hunks, names)
+        except (OSError, SyntaxError, DiffApplyError, ValueError):
+            return None
 
-    def _tree(self, path: str, text: str) -> ast.Module:
-        if path not in self._trees:
-            self._trees[path] = ast.parse(text)
-        return self._trees[path]
+    def _shared_lines(self, suite: str) -> dict[str, set[int]]:
+        if suite not in self._shared:
+            self._shared[suite] = {path: set(lines) for path, lines in self.suites[suite]["queries"]["shared"].items()}
+        return self._shared[suite]
+
+
+def _estimate(actions: list[int], full: bool, digests: list) -> float:
+    """Expected CPU of a probe running these actions, risk of finding a break included."""
+    cpu = PROBE_BASE_S + (ALL_TABLES_S if full else TABLES_S if EXECUTE in actions else 0.0)
+    executing = 0.0
+    for action, entry in zip(actions, digests):
+        if action == SKIP:
+            continue
+        if entry is None:
+            cpu += PARSE_S
+        elif action == CHECK:
+            cpu += entry["check_s"]
+        else:
+            executing += entry["execute_s"]
+    return cpu + executing * (1 + EXECUTE_RISK)
 
 
 def _most_saving(
-    candidates: dict[int, str], reach: dict[str, str], selected: set[int], cost: Callable[[set[int]], float]
+    candidates: dict[int, str], plans: dict[str, Plan | None], selected: set[int], cost: Callable[[set[int]], float]
 ) -> dict[int, str]:
     """The provable TPC tests whose dropping saves the most beyond the probe's CPU; empty when none pays."""
-    provable = [number for number, suite in candidates.items() if reach[suite] != BLOCKED]
+    provable = [number for number, suite in candidates.items() if plans[suite] is not None]
     best: dict[int, str] = {}
     best_gain = 0.0
-    full = cost(selected)
+    total = cost(selected)
     for size in range(1, len(provable) + 1):
         for numbers in combinations(provable, size):
-            suites = [candidates[number] for number in numbers]
-            probe = sum((PROBE_CPU_S if reach[suite] == UNREACHED else REPLAY_CPU_S)[suite] for suite in suites)
-            if any(reach[suite] == REACHED for suite in suites):
-                probe += REPLAY_RISK_S
-            gain = full - cost(selected - set(numbers)) - probe
+            probe = sum(plans[candidates[number]].cpu_s for number in numbers)  # type: ignore[union-attr]
+            gain = total - cost(selected - set(numbers)) - probe
             if gain > best_gain:
                 best, best_gain = {number: candidates[number] for number in numbers}, gain
     return best
 
 
-def _passing(expected: dict[str, tuple[list, bool]]) -> list[str]:
+def prepare_tables(root: Path) -> None:
+    """Write TPC_TABLES from the pinned checkout, in a child that imports the test module."""
+    code = (
+        "import os, sys; from pathlib import Path; "
+        f"sys.path[:0] = [{str(root)!r}, {str(Path(__file__).resolve().parent)!r}]; os.chdir({str(root)!r}); "
+        f"import tpc_fingerprint; tpc_fingerprint.write_tables(Path({str(TPC_TABLES)!r}))"
+    )
+    subprocess.run([sys.executable, "-B", "-c", code], check=True, env={**os.environ, "SKIP_INTEGRATION": "0"})
+
+
+def _passing(expected: dict[str, tuple[list, list[int], bool]]) -> list[str]:
     import tpc_fingerprint
 
-    return [suite for suite, (entries, unreached) in expected.items() if tpc_fingerprint.replay(suite, entries, unreached)]
-
-
-def _start(node: ast.stmt) -> int:
-    decorators = getattr(node, "decorator_list", [])
-    return min([node.lineno, *(decorator.lineno for decorator in decorators)])
-
-
-def _chain(tree: ast.Module, line: int) -> list[ast.stmt]:
-    """Statements enclosing line, outermost first."""
-    chain: list[ast.stmt] = []
-    current: ast.AST = tree
-    while True:
-        inner = next(
-            (
-                child
-                for child in ast.iter_child_nodes(current)
-                if isinstance(child, ast.stmt) and _start(child) <= line <= (child.end_lineno or child.lineno)
-            ),
-            None,
-        )
-        if inner is None:
-            return chain
-        chain.append(inner)
-        current = inner
-
-
-def _qualname(chain: list[ast.stmt]) -> str:
-    return ".".join(node.name for node in chain if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
-
-
-def _functions(tree: ast.Module) -> dict[str, list[tuple[int, int]]]:
-    """Pinned function spans by qualified name."""
-    spans: dict[str, list[tuple[int, int]]] = {}
-
-    def visit(node: ast.AST, prefix: str) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                name = f"{prefix}{child.name}"
-                if not isinstance(child, ast.ClassDef):
-                    spans.setdefault(name, []).append((_start(child), child.end_lineno or child.lineno))
-                visit(child, name + ".")
-            elif isinstance(child, ast.stmt):
-                visit(child, prefix)
-
-    visit(tree, "")
-    return spans
-
-
-def _bound(node: ast.stmt) -> set[str]:
-    """Names a statement binds in its scope, by attribute or subscript base too."""
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-        return {node.name}
-    found: set[str] = set()
-    for each in ast.walk(node):
-        if isinstance(each, ast.alias):
-            found.update((each.asname or each.name).split("."))
-        elif isinstance(each, (ast.Name, ast.Attribute, ast.Subscript)) and isinstance(each.ctx, (ast.Store, ast.Del)):
-            target: ast.AST = each
-            while isinstance(target, ast.Subscript):
-                target = target.value
-            if isinstance(target, ast.Name):
-                found.add(target.id)
-            elif isinstance(target, ast.Attribute):
-                found.add(target.attr)
-    return found
-
-
-def _edit_unreached(
-    chain: list[ast.stmt], line: int, old_functions: dict[str, list[tuple[int, int]]], ran: set[int], names: set[str]
-) -> bool:
-    """Whether an edit on line, inside chain, stays out of what runs outside the digested steps."""
-    function_indexes = [index for index, node in enumerate(chain) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
-    existing = [index for index in function_indexes if _qualname(chain[: index + 1]) in old_functions]
-    for index in existing:
-        for start, end in old_functions[_qualname(chain[: index + 1])]:
-            if ran.intersection(range(start, end + 1)):
-                return False
-    added = [index for index in function_indexes if index not in existing]
-    if added:
-        if existing and existing[0] < added[0]:
-            return True
-        statement: ast.stmt = chain[added[0]]
-    elif function_indexes:
-        function = chain[function_indexes[-1]]
-        if line >= function.body[0].lineno or len(function_indexes) > 1:
-            return True
-        statement = function
-    elif chain:
-        statement = chain[-1]
-        if ran.intersection(range(_start(statement), (statement.end_lineno or statement.lineno) + 1)):
-            return False
-    else:
-        return True
-    if isinstance(statement, ast.Pass) or (
-        isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
-    ):
-        return True
-    bound = _bound(statement)
-    return bool(bound) and not any(name in names or name.startswith("__") for name in bound)
+    return [
+        suite
+        for suite, (entries, actions, full) in expected.items()
+        if tpc_fingerprint.replay(suite, entries, actions, full, TPC_TABLES)
+    ]
