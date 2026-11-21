@@ -20,6 +20,13 @@ from observe import REPLACEMENTS, identity_site
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 MAX_PROBE_MS = 850
+# Cheap tests get the original alarm. A slow optimizer replay is killed and
+# kept if the cached jobs do not finish; an executor run is never started.
+CHEAP_ALARM_S = 0.75
+SLOW_ALARM_S = 1.0
+BATCH_PROBE_S = 90.0
+OPTIMIZER_REPLAY = "tests/test_optimizer.py"
+ORDER_OPS = {"Eq", "NotEq", "Lt", "LtE", "Gt", "GtE"}
 
 
 def changes(root, diff):
@@ -210,10 +217,28 @@ class Impact:
         return selected
 
 
+def _swap_target(previous, current):
+    """Return the new comparison operator when that is the only change to the node."""
+    if len(previous.ops) != 1 or len(current.ops) != 1:
+        return None
+    old_op = type(previous.ops[0]).__name__
+    new_op = type(current.ops[0]).__name__
+    if old_op == new_op:
+        return None
+    if old_op in ("Is", "IsNot"):
+        partner = "Eq" if old_op == "Is" else "NotEq"
+        if new_op == partner and identity_site(previous):
+            return old_op, new_op
+        return None
+    if old_op in ORDER_OPS and new_op in ORDER_OPS:
+        return old_op, new_op
+    return None
+
+
 def comparison_edits(edits):
-    """Identify patches consisting solely of supported comparison changes."""
+    """Patches whose only AST change is one or more comparison-operator swaps."""
     sites = []
-    operator_text = re.compile(r"\bis\b|[<>]")
+    operator_text = re.compile(r"\bis\b|!=|==|[<>]")
     for path, (before, after, removed, _) in edits.items():
         if not path.startswith("sqlglot/") or not path.endswith(".py") or not removed:
             return []
@@ -230,20 +255,26 @@ def comparison_edits(edits):
         if len(old_nodes) != len(new_nodes):
             return []
         for previous, current in zip(old_nodes, new_nodes):
-            if len(previous.ops) != 1 or len(current.ops) != 1:
+            swap = _swap_target(previous, current)
+            if swap is None:
                 continue
-            op = type(previous.ops[0]).__name__
-            replacement = REPLACEMENTS.get(op)
-            if not replacement or replacement[0] != type(current.ops[0]).__name__:
-                continue
-            if op in ("Is", "IsNot") and not identity_site(previous):
-                continue
+            old_op, new_op = swap
             sites.append((path, previous.lineno, previous.end_lineno,
-                          f"{path}:{previous.lineno}:{previous.col_offset}"))
+                          f"{path}:{previous.lineno}:{previous.col_offset}", old_op, new_op))
             current.ops = previous.ops
         if ast.dump(old) != ast.dump(new):
             return []
     return sites
+
+
+def _equivalent(value, old_op, new_op):
+    """True when a baseline record proves this swap returns the same bool."""
+    if value is True:
+        partner = REPLACEMENTS.get(old_op)
+        return bool(partner) and partner[0] == new_op
+    if isinstance(value, str) and value:
+        return new_op in value.split(",")
+    return False
 
 
 def exclude_equivalent(candidates, edits, observations, impact):
@@ -253,18 +284,19 @@ def exclude_equivalent(candidates, edits, observations, impact):
     if not sites:
         return candidates
     # Startup observations can affect later tests through shared state.
-    if any(observations.get(key, {}).get("") is False for _, _, _, key in sites):
+    if any(not _equivalent(observations.get(key, {}).get(""), old_op, new_op)
+           for _, _, _, key, old_op, new_op in sites if "" in observations.get(key, {})):
         return candidates
     eligible = candidates - impact.unknown - impact.source_sensitive
     for path in edits:
         eligible.difference_update(impact.readers[path])
     confirmed = set(eligible)
-    for path, first, last, key in sites:
+    for path, first, last, key, old_op, new_op in sites:
         evidence = observations.get(key, {})
-        if overlaps(impact.collection.get(path, ()), first, last) and evidence.get("") is not True:
+        if overlaps(impact.collection.get(path, ()), first, last) and not _equivalent(evidence.get(""), old_op, new_op):
             return candidates
         covered = {n for n, lines in impact.cover[path] if overlaps(lines, first, last)}
-        matching = {n for n in eligible if evidence.get(impact.tests[n]["id"]) is True}
+        matching = {n for n in eligible if _equivalent(evidence.get(impact.tests[n]["id"]), old_op, new_op)}
         if not matching:
             return candidates
         # A test listed by the scope-level filter may never reach this expression.
@@ -309,6 +341,8 @@ def overlay(base, dest, edits):
 
 
 class ProbeResult(unittest.TestResult):
+    limits = {}
+
     def __init__(self):
         super().__init__()
         self.failed = set()
@@ -317,7 +351,7 @@ class ProbeResult(unittest.TestResult):
     def startTest(self, test):
         self.active = test.id()
         super().startTest(test)
-        signal.setitimer(signal.ITIMER_REAL, 0.75)
+        signal.setitimer(signal.ITIMER_REAL, type(self).limits.get(test.id(), CHEAP_ALARM_S))
 
     def stopTest(self, test):
         signal.setitimer(signal.ITIMER_REAL, 0)
@@ -371,9 +405,10 @@ def job_impact(edits):
     return affected
 
 
-def probe(tests, edits):
+def probe(tests, edits, publish):
+    """Run base-suite unittest cases. publish(passed, failed, errors) after each one."""
     InlinePool.impact = job_impact(edits)
-    """Run base-suite unittest cases with their class and module lifecycle."""
+    ProbeResult.limits = {}
     signal.signal(signal.SIGALRM, timeout)
     for path in edits:
         if path.startswith("sqlglot/") and path.endswith(".py"):
@@ -381,11 +416,17 @@ def probe(tests, edits):
             try:
                 importlib.import_module(module)
             except Exception:
-                return set(), {"*"}
+                publish(set(), set(), {"*"})
+                return
     names = {}
     cases = []
     failed_files = set()
-    provisional = set()
+    passed = set()
+    failed = set()
+
+    def flush():
+        publish(passed, failed, failed_files)
+
     for test in tests:
         file, *parts = test["id"].split("::")
         module = file.removesuffix(".py").replace("/", ".")
@@ -396,39 +437,69 @@ def probe(tests, edits):
             continue
         if hasattr(imported, "ProcessPoolExecutor"):
             imported.ProcessPoolExecutor = InlinePool
-        if len(parts) != 2 or test["ms"] > MAX_PROBE_MS:
-            provisional.add(test["number"])
+        if len(parts) != 2:
             continue
         cls = getattr(imported, parts[0], None)
         if not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
-            provisional.add(test["number"])
             continue
         try:
             case = cls(parts[1])
         except Exception:
-            provisional.add(test["number"])
             continue
         cases.append(case)
         names[case.id()] = test["number"]
+        if test["ms"] > MAX_PROBE_MS:
+            ProbeResult.limits[case.id()] = SLOW_ALARM_S
 
     result = ProbeResult()
+    original_stop = result.stopTest
+
+    def stop_and_publish(test):
+        original_stop(test)
+        number = names.get(test.id())
+        if number is None:
+            return
+        if test.id() in result.failed:
+            failed.add(number)
+        else:
+            passed.add(number)
+        flush()
+
+    result.stopTest = stop_and_publish
     unittest.TestSuite(cases).run(result)
-    failed = {names[name] for name in result.failed if name in names}
     for name in result.failed - names.keys():
         # unittest uses string IDs such as setUpClass (tests.foo.Class).
         target = name.rsplit("(", 1)[-1].removesuffix(")")
         failed.update(number for case, number in names.items() if case.startswith(target + "."))
-    return failed | provisional, failed_files
+        passed.difference_update(failed)
+    flush()
 
 
-def verify(root, edits, tests):
-    """Use a fresh process namespace for each patch and capture test stdout."""
+def _read_probe(path):
+    try:
+        passed, failed, errors = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return set(), set(), set()
+    if not isinstance(passed, list) or not isinstance(failed, list) or not isinstance(errors, list):
+        return set(), set(), set()
+    return set(passed), set(failed), set(errors)
+
+
+def verify(root, edits, tests, budget):
+    """Replay this commit's targets in one fresh process. A killed run keeps partial passes."""
     with tempfile.TemporaryDirectory(prefix="blast-") as folder:
         folder = Path(folder)
         tree = folder / "checkout"
         tree.mkdir()
         overlay(root, tree, edits)
         result_path = folder / "result.json"
+
+        def publish(passed, failed, errors):
+            payload = json.dumps([sorted(passed), sorted(failed), sorted(errors)])
+            temporary = result_path.with_suffix(".part")
+            temporary.write_text(payload)
+            temporary.replace(result_path)
+
         pid = os.fork()
         if pid == 0:
             try:
@@ -438,12 +509,11 @@ def verify(root, edits, tests):
                 os.setsid()
                 os.chdir(tree)
                 sys.path.insert(0, str(tree))
-                chosen, errors = probe(tests, edits)
-                result_path.write_text(json.dumps([sorted(chosen), sorted(errors)]))
+                probe(tests, edits, publish)
                 os._exit(0)
             except BaseException:
                 os._exit(1)
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + budget
         while not os.waitpid(pid, os.WNOHANG)[0]:
             if time.monotonic() >= deadline:
                 try:
@@ -454,8 +524,8 @@ def verify(root, edits, tests):
                 break
             time.sleep(0.005)
         if result_path.exists():
-            return json.loads(result_path.read_text())
-        return [t["number"] for t in tests], []
+            return _read_probe(result_path)
+        return set(), set(), set()
 
 
 def split(chosen, durations):
@@ -487,6 +557,42 @@ def schedule_cost(groups, durations):
     return max((sum(durations[j] for j in g) for g in groups), default=0) + 2000 * len(groups)
 
 
+def tests_to_replay(candidates, tests, durations, cache_replay):
+    """Cheap tests, or the slow optimizer test that sets the schedule.
+
+    Tests over 850 ms are kept when a shorter replay cannot change the cost.
+    The exception is an optimizer test that itself sets that cost: its pooled
+    SQL calls come from the baseline cache unless they touched the patch, so
+    a pass can be shown inside the one-second alarm. Executor and parser
+    monsters are not replayed; running them costs about as much CPU as it saves.
+    """
+    by_number = {test["number"]: test for test in tests}
+    expensive = set()
+    cheap = []
+    slow = []
+    for number in candidates:
+        test = by_number[number]
+        if test["ms"] <= MAX_PROBE_MS:
+            cheap.append(test)
+        else:
+            expensive.add(number)
+            if cache_replay and test["file"] == OPTIMIZER_REPLAY:
+                slow.append(test)
+    base = schedule_cost(split(candidates, durations), durations)
+    alarm_ms = int(SLOW_ALARM_S * 1000)
+    worth = []
+    for test in slow:
+        saved = base - schedule_cost(split(candidates - {test["number"]}, durations), durations)
+        if saved > alarm_ms:
+            worth.append(test)
+    anchored = bool(expensive) and base == schedule_cost(split(expensive, durations), durations)
+    if anchored:
+        worth.sort(key=lambda test: -test["ms"])
+        return worth
+    cheap.sort(key=lambda test: test["number"])
+    return cheap
+
+
 def cpu_time():
     return sum(sum(resource.getrusage(who)[:2])
                for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN))
@@ -512,30 +618,49 @@ def main():
     sys.dont_write_bytecode = True
     importlib.import_module("pandas")
     importlib.import_module("duckdb")
+    probe_budget = BATCH_PROBE_S
     for patch in sorted((data / "commits").glob("*.patch")):
         started = cpu_time() if os.environ.get("BLAST_STATS") else 0
         candidates = set()
+        confirmed = set()
+        edits = {}
         try:
             edits = changes(root, patch.read_text())
-            candidates = exclude_equivalent(
-                impact.candidates(edits), edits, observed, impact
+            raw = impact.candidates(edits)
+            candidates = exclude_equivalent(raw, edits, observed, impact)
+            confirmed = raw - candidates
+            one_fixture_owner = len(candidates) == 1 and all(
+                path.startswith("tests/fixtures/") for path in edits
             )
-            expensive = {n for n in candidates if durations[n] > MAX_PROBE_MS}
-            one_fixture_owner = len(candidates) == 1 and all(path.startswith("tests/fixtures/") for path in edits)
-            if one_fixture_owner or (expensive and schedule_cost(split(candidates, durations), durations) == schedule_cost(
-                split(expensive, durations), durations
-            )):
-                # Probing the rest cannot lower the cost while expensive tests
-                # remain in the plan. Keep all candidates in this case.
-                chosen = candidates
-            elif candidates:
-                chosen, errors = verify(root, edits, [t for t in tests if t["number"] in candidates])
-                chosen = set(chosen)
-                chosen.update(t["number"] for t in tests if "*" in errors or t["file"] in errors)
+            # A fixture's own reader is the assertion. Replaying it spends CPU
+            # to rediscover a failure. Other commits replay every test whose
+            # result can change the schedule.
+            cache_replay = job_impact(edits) is not None
+            targets = [] if one_fixture_owner or probe_budget < 0.2 else tests_to_replay(
+                candidates, tests, durations, cache_replay
+            )
+            if targets:
+                slow_count = sum(test["ms"] > MAX_PROBE_MS for test in targets)
+                allowance = min(probe_budget, 3.0 + SLOW_ALARM_S * slow_count)
+                began = time.monotonic()
+                passed, failed, errors = verify(root, edits, targets, allowance)
+                probe_budget -= time.monotonic() - began
+                if "*" in errors:
+                    chosen = set(impact.all)
+                else:
+                    confirmed.update(passed - failed)
+                    confirmed.difference_update(
+                        test["number"] for test in tests if test["file"] in errors
+                    )
+                    chosen = set(candidates) - confirmed
+                    chosen.update(
+                        test["number"] for test in tests if test["file"] in errors
+                    )
             else:
-                chosen = set()
+                chosen = set(candidates)
         except (OSError, ValueError, IndexError, StopIteration):
             chosen = impact.all
+            confirmed = set()
         if os.environ.get("BLAST_STATS"):
             print(f"{patch.stem}: {len(chosen)} selected (from {len(candidates)}) CPU {cpu_time()-started:.4f}", file=sys.stderr)
         workers = full_schedule if chosen == impact.all else split(chosen, durations)

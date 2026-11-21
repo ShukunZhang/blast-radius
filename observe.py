@@ -1,4 +1,4 @@
-"""Observe identity/equality equivalence on baseline test inputs."""
+"""Observe which comparison swaps are equivalent on baseline test inputs."""
 import ast
 import enum
 import importlib.abc
@@ -20,6 +20,17 @@ REPLACEMENTS = {
     "LtE": ("Lt", operator.le, operator.lt),
     "Gt": ("GtE", operator.gt, operator.ge),
     "GtE": ("Gt", operator.ge, operator.gt),
+}
+# Ordering and equality swaps are pure on the types comparable() accepts, so
+# every alternative is recorded. Identity keeps the single paired check.
+ORDER_OPS = ("Eq", "NotEq", "Lt", "LtE", "Gt", "GtE")
+ORDER_FUNCTIONS = {
+    "Eq": operator.eq,
+    "NotEq": operator.ne,
+    "Lt": operator.lt,
+    "LtE": operator.le,
+    "Gt": operator.gt,
+    "GtE": operator.ge,
 }
 
 
@@ -51,7 +62,9 @@ class Instrument(ast.NodeTransformer):
         if len(node.ops) != 1:
             return node
         op = type(node.ops[0]).__name__
-        if op not in REPLACEMENTS or (op in ("Is", "IsNot") and not identity_site(node)):
+        if op not in ORDER_FUNCTIONS and op not in ("Is", "IsNot"):
+            return node
+        if op in ("Is", "IsNot") and not identity_site(node):
             return node
         key = f"{self.filename}:{node.lineno}:{node.col_offset}"
         return ast.copy_location(ast.Call(
@@ -60,21 +73,40 @@ class Instrument(ast.NodeTransformer):
              ast.Constant(op)], []), node)
 
 
+def _narrow(previous, equivalent):
+    if previous is False:
+        return False
+    if not equivalent:
+        return False
+    if previous is None:
+        return equivalent
+    kept = [name for name in equivalent.split(",") if name in previous.split(",")]
+    return ",".join(kept) if kept else False
+
+
 def observe(key, left, right, op):
-    _, original, replacement = REPLACEMENTS[op]
-    result = original(left, right)
-    observations = OBSERVED.setdefault(key, {})
-    if observations.get(CURRENT_TEST) is not False:
-        if op in ("Is", "IsNot"):
-            if right is None:
-                safe = (left is None or type(left).__eq__ is object.__eq__
-                        or type(left) in (str, int, bool, float, tuple, list, dict, set, bytes))
-            else:
-                safe = (isinstance(right, enum.Enum) and type(left) is type(right)
-                        and type(left).__eq__ in (object.__eq__, str.__eq__, int.__eq__))
+    if op in ("Is", "IsNot"):
+        original = operator.is_ if op == "Is" else operator.is_not
+        partner = "Eq" if op == "Is" else "NotEq"
+        result = original(left, right)
+        if right is None:
+            safe = (left is None or type(left).__eq__ is object.__eq__
+                    or type(left) in (str, int, bool, float, tuple, list, dict, set, bytes))
         else:
-            safe = comparable(left, right)
-        observations[CURRENT_TEST] = safe and replacement(left, right) == result
+            safe = (isinstance(right, enum.Enum) and type(left) is type(right)
+                    and type(left).__eq__ in (object.__eq__, str.__eq__, int.__eq__))
+        equivalent = partner if safe and ORDER_FUNCTIONS[partner](left, right) == result else ""
+    else:
+        result = ORDER_FUNCTIONS[op](left, right)
+        if comparable(left, right):
+            equivalent = ",".join(
+                name for name in ORDER_OPS
+                if name != op and ORDER_FUNCTIONS[name](left, right) == result
+            )
+        else:
+            equivalent = ""
+    observations = OBSERVED.setdefault(key, {})
+    observations[CURRENT_TEST] = _narrow(observations.get(CURRENT_TEST), equivalent)
     return result
 
 
