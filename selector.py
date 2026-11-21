@@ -28,7 +28,7 @@ from analyze import (
     tightest,
 )
 from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
-from edits import component_sinks, data_only, identity_swap
+from edits import boundary_unreachable, data_only, identity_swap, loaded_mentions, proven_readers
 from pack import pack
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -210,7 +210,7 @@ class Selector:
         except SyntaxError:
             return self.importers_of(path) | tests_touching(self.coverage, path)
         old_tree = ast.parse(original)
-        if identity_swap(old_tree, new_tree):
+        if identity_swap(old_tree, new_tree) or boundary_unreachable(old_tree, new_tree):
             return set()
         # A value change does not send new tests into the line. Tests that
         # never executed it cannot observe it. Control-flow edits stay wide.
@@ -251,30 +251,12 @@ class Selector:
             end = statement.end_lineno if statement is not None and statement.end_lineno else line
             selected = tests_on_lines(self.coverage, path, start, end)
             if not selected:
-                return tests_on_lines(self.coverage, path, line, _end(function))
+                tail = tests_on_lines(self.coverage, path, line, _end(function))
+                if tail:
+                    return tail
+                return tests_on_lines(self.coverage, path, _start(function), _end(function))
             return selected
         return self._scope_name(path, tree, line, tightest(classes, line), narrow)
-
-    def _observed_value(self, name: str, class_node: ast.AST | None) -> set[int]:
-        if self.mentions(name) is not None:
-            sinks = component_sinks(self.root, name, self.mentions)
-            readers: set[int] = set()
-            for relative, lineno in sinks or []:
-                readers |= self.coverage.get(relative, {}).get(lineno, set())
-            return readers
-        if class_node is None:
-            return set()
-        class_name = class_node.name  # type: ignore[attr-defined]
-        mentions = self.mentions(class_name)
-        if not mentions:
-            return set()
-        readers = set()
-        for relative, lineno in mentions:
-            owners = self.coverage.get(relative, {}).get(lineno, set())
-            if len(owners) > HOT_REFERENCE:
-                return set()
-            readers |= owners
-        return readers
 
     def _scope_name(
         self, path: str, tree: ast.AST, line: int, class_node: ast.AST | None, narrow: bool
@@ -295,11 +277,15 @@ class Selector:
                     break
                 readers |= owners
             if readers and not shared:
+                # Drop tests that only stored the same name on another class.
+                # Tests that load it, including through a shared dialect helper, stay.
+                loaded = loaded_mentions(
+                    names[0], self.mentions, self.coverage, self.root, path, tree, line
+                )
+                kept = readers & loaded if loaded is not None else set()
+                if kept:
+                    return kept
                 return readers
-        if narrow and len(names) == 1:
-            observed = self._observed_value(names[0], class_node)
-            if observed:
-                return observed
         useful = [name for name in names if self.mentions(name) is not None]
         if class_node is not None and not useful:
             class_name = class_node.name  # type: ignore[attr-defined]
@@ -313,6 +299,14 @@ class Selector:
                 owners = self.coverage.get(relative, {}).get(lineno, set())
                 if 0 < len(owners) <= HOT_REFERENCE:
                     selected |= owners
+        if narrow and len(names) == 1 and selected:
+            class_name = class_node.name if class_node is not None else None  # type: ignore[attr-defined]
+            proven = proven_readers(
+                names[0], class_name, self.mentions, self.coverage, self.root, HOT_REFERENCE
+            )
+            kept = selected & proven if proven is not None else set()
+            if kept:
+                return kept
         return selected
 
     def _insertion(self, path: str, old_tree: ast.AST, new_tree: ast.AST, lines: list[int]) -> set[int]:
