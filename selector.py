@@ -533,6 +533,38 @@ def _added_text(file_diff: FileDiff) -> str:
     return "\n".join(text for _line, text in added_lines(file_diff.hunks)) + "\n"
 
 
+def drop_slow_if_companions_pass(
+    patch_text: str,
+    catalog: list[dict],
+    selected: set[int],
+    seconds: dict[int, float],
+    heavy: set[int],
+) -> set[int]:
+    """Drop a long test when every short companion passes.
+
+    A 21s test only stays when a test under half a second, run on the patched
+    tree, actually fails. Optimizer and executor fixtures are not used as that
+    signal: replaying them costs more than a worker.
+    """
+    slow = {number for number in selected if seconds.get(number, 0.0) >= 3.0}
+    companions = selected - slow
+    if not slow or not companions or companions & heavy:
+        return selected
+    if len(companions) > MAX_COMPANIONS:
+        return selected
+    if max(seconds.get(number, 0.0) for number in companions) > 0.5:
+        return selected
+    failed = confirm(ROOT, patch_text, catalog, companions)
+    if not failed:
+        return set()
+    if failed == companions:
+        return selected
+    return slow | failed
+
+
+MAX_COMPANIONS = 8
+
+
 def main() -> None:
     catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     numbers = {test["id"]: test["number"] for test in catalog}
@@ -549,6 +581,7 @@ def main() -> None:
     for patch in commits:
         text = patch.read_text(encoding="utf-8")
         selected = selector.choose(text)
+        selected = drop_slow_if_companions_pass(text, catalog, selected, seconds, heavy)
         if should_probe(selected, seconds, text, heavy):
             selected = confirm(ROOT, text, catalog, selected)
         print(json.dumps({"commit": patch.stem, "workers": pack(selected, seconds)}, separators=(",", ":")))
