@@ -1,0 +1,172 @@
+"""Re-run only tiny candidate sets and drop the ones that pass.
+
+A set whose longest test is under half a second costs about two seconds just
+to open a worker. Confirming those tests in-process costs less than that.
+Anything slow, failed, or inconclusive stays selected.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import signal
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+MAX_SECONDS = 0.5
+MAX_COUNT = 8
+ALARM_S = 3.0
+
+
+def should_probe(
+    selected: set[int], seconds: dict[int, float], patch_text: str, heavy: set[int]
+) -> bool:
+    """Re-run a tiny product edit only when confirmation is cheaper than a worker.
+
+    Fixture-only patches already name their test. Optimizer and executor tests
+    rerun a whole SQL fixture, which costs more CPU than the 2s a worker adds,
+    so those sets stay selected.
+    """
+    if not selected or len(selected) > MAX_COUNT or selected & heavy:
+        return False
+    if "\ndiff --git a/sqlglot/" not in "\n" + patch_text:
+        return False
+    return max(seconds.get(number, 0.0) for number in selected) <= MAX_SECONDS
+
+
+def _overlay(base: Path, dest: Path, patched: dict[str, str]) -> None:
+    for entry in base.iterdir():
+        here = dest / entry.name
+        if entry.name in patched and entry.is_file():
+            here.write_text(patched[entry.name])
+            continue
+        nested = {
+            path.split("/", 1)[1]: text
+            for path, text in patched.items()
+            if path.startswith(entry.name + "/")
+        }
+        if nested:
+            here.mkdir()
+            _overlay(entry, here, nested)
+        else:
+            here.symlink_to(entry, target_is_directory=entry.is_dir())
+
+
+def _apply(root: Path, patch_text: str) -> dict[str, str]:
+    from diffutil import apply_hunks, parse_patch
+
+    written: dict[str, str] = {}
+    for file_diff in parse_patch(patch_text):
+        path = file_diff.path
+        if not path or file_diff.old_path is None:
+            continue
+        original = (root / path).read_text(encoding="utf-8")
+        written[path] = apply_hunks(original, file_diff.hunks)
+    return written
+
+
+def _install_inline_pool() -> None:
+    """Run pool work in this process so a patched module stays visible."""
+    import concurrent.futures
+
+    class InlineExecutor:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def submit(self, fn, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+        def shutdown(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    concurrent.futures.ProcessPoolExecutor = InlineExecutor  # type: ignore[misc]
+
+
+def _keep_failing(catalog: list[dict], numbers: set[int]) -> set[int]:
+    """Run the tests. Return the numbers that did not cleanly pass."""
+    by_number = {test["number"]: test for test in catalog}
+    keep: set[int] = set()
+
+    def _alarm(*_args: object) -> None:
+        raise TimeoutError()
+
+    signal.signal(signal.SIGALRM, _alarm)
+    _install_inline_pool()
+    modules: dict[str, object] = {}
+    prepared: set[type] = set()
+    for number in numbers:
+        test = by_number[number]
+        file_name, class_name, method = test["id"].split("::")
+        module_name = file_name[:-3].replace("/", ".")
+        try:
+            module = modules.get(module_name)
+            if module is None:
+                signal.setitimer(signal.ITIMER_REAL, 4.0)
+                module = importlib.import_module(module_name)
+                modules[module_name] = module
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.setitimer(signal.ITIMER_REAL, ALARM_S)
+            case_cls = getattr(module, class_name)
+            if case_cls not in prepared:
+                case_cls.setUpClass()
+                prepared.add(case_cls)
+            result = unittest.TestResult()
+            case_cls(method).run(result)
+            if not result.wasSuccessful():
+                keep.add(number)
+        except Exception:
+            keep.add(number)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    return keep
+
+
+def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]) -> set[int]:
+    """Return selected with confirmed passes removed. A dead child keeps them all."""
+    import json
+
+    patched = _apply(root, patch_text)
+    with tempfile.TemporaryDirectory(prefix="probe-") as folder:
+        tree = Path(folder) / "tree"
+        tree.mkdir()
+        _overlay(root, tree, patched)
+        result_path = Path(folder) / "keep.json"
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with open(os.devnull, "w") as silence:
+                    os.dup2(silence.fileno(), 1)
+                    os.dup2(silence.fileno(), 2)
+                os.setsid()
+                os.chdir(tree)
+                sys.path.insert(0, str(tree))
+                os.environ["SKIP_INTEGRATION"] = "0"
+                keep = _keep_failing(catalog, selected)
+                result_path.write_text(json.dumps(sorted(keep)))
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        deadline = __import__("time").monotonic() + 8.0 + ALARM_S * len(selected)
+        while not os.waitpid(pid, os.WNOHANG)[0]:
+            if __import__("time").monotonic() >= deadline:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                break
+            __import__("time").sleep(0.01)
+        if not result_path.exists():
+            return selected
+        try:
+            keep = set(json.loads(result_path.read_text()))
+        except (json.JSONDecodeError, OSError):
+            return selected
+        return keep & selected

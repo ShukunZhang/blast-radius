@@ -39,6 +39,7 @@ from edits import (
     proven_readers,
 )
 from pack import pack
+from probe_small import confirm, should_probe
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))
@@ -273,8 +274,9 @@ class Selector:
             statement = statement_at(tree, line)
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 return self.importers_of(path) | tests_touching(self.coverage, path)
-            # An and/or only changes tests that enter that expression. Tests that
-            # merely call the surrounding function and take another branch stay green.
+            # An and/or is only observed by tests that entered that expression.
+            # On the sample every failing test of such an edit is in this set;
+            # tests that only ran another branch of the function are not.
             boolop = tightest([node for node in ast.walk(tree) if isinstance(node, ast.BoolOp)], line)
             if boolop is not None:
                 owners = tests_on_lines(self.coverage, path, boolop.lineno, _end(boolop))
@@ -315,11 +317,16 @@ class Selector:
             return readers
         if isinstance(statement, ast.Assign) and not isinstance(statement.value, (ast.Dict, ast.Constant, ast.UnaryOp)):
             return readers
-        return {
+        narrowed = {
             number
             for number in readers
             if "/dialects/" not in self.id_of.get(number, "") or dialect in self.id_of.get(number, "")
         }
+        # Another dialect's copy of this dict does not hold the overridden table.
+        # A bare integer can still be read by a shared test with no dialect in its name.
+        if isinstance(statement.value, ast.Dict):
+            return narrowed
+        return narrowed or readers
 
     def _dict_key_readers(self, tree: ast.AST, line: int) -> set[int]:
         """Tests that execute a line naming this dict entry, not every importer of the literal."""
@@ -379,14 +386,8 @@ class Selector:
                 kept = readers & loaded if loaded is not None else set()
                 if kept:
                     return self._dialect_readers(path, statement, kept, narrow)
-                # No traced load of this value. The remaining lines only store
-                # the same name on another class, or pass the whole object into
-                # a helper every test runs. A data-only edit does not fail those.
-                if narrow:
-                    return set()
-                return readers
-            if narrow:
-                return set()
+                return readers or self._line_or_class(path, tree, line, class_node)
+            return readers or self._line_or_class(path, tree, line, class_node)
         useful = [name for name in names if self.mentions(name) is not None]
         if class_node is not None and not useful:
             class_name = class_node.name  # type: ignore[attr-defined]
@@ -410,7 +411,20 @@ class Selector:
             kept = selected & proven if proven is not None else set()
             if kept:
                 return kept
-        return selected
+        return selected or self._line_or_class(path, tree, line, class_node)
+
+    def _line_or_class(
+        self, path: str, tree: ast.AST, line: int, class_node: ast.AST | None
+    ) -> set[int]:
+        """Tests that executed this line or its class. Never the shared helper line."""
+        selected = set(self.coverage.get(path, {}).get(line, ()))
+        if selected:
+            return selected
+        if class_node is not None:
+            selected = tests_on_lines(self.coverage, path, _start(class_node), _end(class_node))
+            if selected:
+                return selected
+        return tests_touching(self.coverage, path)
 
     def _insertion(self, path: str, old_tree: ast.AST, new_tree: ast.AST, lines: list[int]) -> set[int]:
         selected: set[int] = set()
@@ -485,9 +499,18 @@ def main() -> None:
     seconds = {test["number"]: float(test["seconds"]) for test in catalog}
     coverage = load_coverage(COVERAGE_MAP, numbers)
     selector = Selector(ROOT, coverage, catalog)
+    # These tests call check_file, which re-executes an entire SQL fixture.
+    heavy = {
+        test["number"]
+        for test in catalog
+        if test["file"] in {"tests/test_optimizer.py", "tests/test_executor.py"}
+    }
     commits = sorted((DATA / "commits").glob("*.patch"))
     for patch in commits:
-        selected = selector.choose(patch.read_text(encoding="utf-8"))
+        text = patch.read_text(encoding="utf-8")
+        selected = selector.choose(text)
+        if should_probe(selected, seconds, text, heavy):
+            selected = confirm(ROOT, text, catalog, selected)
         print(json.dumps({"commit": patch.stem, "workers": pack(selected, seconds)}, separators=(",", ":")))
         print(f"{patch.stem}: {len(selected)} tests", file=sys.stderr)
 

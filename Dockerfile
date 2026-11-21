@@ -10,12 +10,15 @@ RUN tar -xzf /tmp/sqlglot.tar.gz -C /opt \
     && chmod -R a+rX /opt/sqlglot
 
 WORKDIR /app
-COPY selector.py analyze.py diffutil.py edits.py pack.py /app/
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir 'duckdb==2.0.0' 'pandas==3.1.1'
+COPY selector.py analyze.py diffutil.py edits.py pack.py probe_small.py /app/
 COPY maps /app/maps
 RUN chmod -R a+rX /app
 
 ENV SQLGLOT_ROOT=/opt/sqlglot \
     COVERAGE_MAP=/app/maps/coverage.bin \
+    SKIP_INTEGRATION=0 \
     PYTHONDONTWRITEBYTECODE=1
 
 CMD ["python", "-B", "/app/selector.py"]
