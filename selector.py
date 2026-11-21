@@ -325,8 +325,48 @@ class Selector:
         # Another dialect's copy of this dict does not hold the overridden table.
         # A bare integer can still be read by a shared test with no dialect in its name.
         if isinstance(statement.value, ast.Dict):
-            return narrowed
+            # Other dialects' copies of this table are not this override. If none
+            # of the remaining readers are this dialect, keep the tests that
+            # executed the class itself. An empty set here is a missed failure.
+            return narrowed or self._class_observers(path, statement) or self._dialect_from_hot(path, statement)
         return narrowed or readers
+
+    def _class_observers(self, path: str, statement: ast.AST) -> set[int]:
+        """Tests that executed this class, skipping lines shared by the whole suite."""
+        source = self.root / path
+        try:
+            tree = ast.parse(source.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            return set()
+        _, classes = functions_and_classes(tree)
+        class_node = tightest(classes, statement.lineno)
+        if class_node is None:
+            return set()
+        selected: set[int] = set()
+        by_line = self.coverage.get(path, {})
+        for lineno in range(_start(class_node), _end(class_node) + 1):
+            owners = by_line.get(lineno, ())
+            if 0 < len(owners) <= HOT_REFERENCE:
+                selected.update(owners)
+        return selected
+
+    def _dialect_from_hot(self, path: str, statement: ast.AST) -> set[int]:
+        """This dialect's tests on a line shared by the whole suite.
+
+        Import-time tables are often executed only on a helper line that every
+        test runs. The tests whose id names this dialect are the ones that
+        loaded this class's copy.
+        """
+        dialect = _owning_dialect(path)
+        names = assigned_names(statement)
+        if dialect is None or len(names) != 1 or self.mentions(names[0]) is None:
+            return set()
+        selected: set[int] = set()
+        for relative, lineno in self.mentions(names[0]) or []:
+            owners = self.coverage.get(relative, {}).get(lineno, ())
+            if len(owners) > HOT_REFERENCE:
+                selected.update(number for number in owners if dialect in self.id_of.get(number, ""))
+        return selected
 
     def _dict_key_readers(self, tree: ast.AST, line: int) -> set[int]:
         """Tests that execute a line naming this dict entry, not every importer of the literal."""
