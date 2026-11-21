@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import json
-import math
 import os
 import struct
 import sys
@@ -29,18 +28,14 @@ from analyze import (
     tightest,
 )
 from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
+from pack import pack
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))
 COVERAGE_MAP = Path(os.environ.get("COVERAGE_MAP", "/app/maps/coverage.bin"))
-MAX_WORKERS = 4
 # A reference line executed by this many tests is a shared helper, not a signal
 # that those tests depend on the particular class attribute that changed.
 HOT_REFERENCE = 40
-
-
-def duration_ms(seconds: float) -> int:
-    return math.floor(seconds * 1000 + 0.5)
 
 
 def load_coverage(path: Path, numbers: dict[str, int]) -> dict[str, dict[int, set[int]]]:
@@ -115,21 +110,6 @@ def _signature(function: ast.AST, line: int) -> bool:
     body = getattr(function, "body", None) or []
     body_start = body[0].lineno if body else _start(function) + 1
     return _start(function) <= line < body_start
-
-
-def pack(selected: set[int], millis: dict[int, int]) -> list[list[int]]:
-    """Longest test first, onto the lightest of up to four workers."""
-    if not selected:
-        return []
-    ordered = sorted(selected, key=lambda number: millis.get(number, 0), reverse=True)
-    slots = min(MAX_WORKERS, len(ordered))
-    loads = [0] * slots
-    workers: list[list[int]] = [[] for _ in range(slots)]
-    for number in ordered:
-        lightest = min(range(slots), key=lambda index: loads[index])
-        workers[lightest].append(number)
-        loads[lightest] += millis.get(number, 0)
-    return [worker for worker in workers if worker]
 
 
 class Selector:
@@ -348,13 +328,13 @@ def _added_text(file_diff: FileDiff) -> str:
 def main() -> None:
     catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     numbers = {test["id"]: test["number"] for test in catalog}
-    millis = {test["number"]: duration_ms(test["seconds"]) for test in catalog}
+    seconds = {test["number"]: float(test["seconds"]) for test in catalog}
     coverage = load_coverage(COVERAGE_MAP, numbers)
     selector = Selector(ROOT, coverage, catalog)
     commits = sorted((DATA / "commits").glob("*.patch"))
     for patch in commits:
         selected = selector.choose(patch.read_text(encoding="utf-8"))
-        print(json.dumps({"commit": patch.stem, "workers": pack(selected, millis)}, separators=(",", ":")))
+        print(json.dumps({"commit": patch.stem, "workers": pack(selected, seconds)}, separators=(",", ":")))
         print(f"{patch.stem}: {len(selected)} tests", file=sys.stderr)
 
 
