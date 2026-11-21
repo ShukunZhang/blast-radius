@@ -18,9 +18,11 @@ sample: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
 	python3 ../blast-radius-sample/score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
 
-# Score without Docker. Requires SQLGLOT_ROOT pointing at commit eb11aec.
+# Score without Docker. Requires the build-time maps and a checkout of eb11aec.
 local:
-	DATA_DIR=$(SAMPLE) SQLGLOT_ROOT=$${SQLGLOT_ROOT:-/tmp/sqlglot-src} \
-		COVERAGE_MAP=$(CURDIR)/maps/coverage.bin \
+	PYTHONPATH=$(CURDIR) BLAST_DATA=$(SAMPLE) \
+		BLAST_ROOT=$${SQLGLOT_ROOT:-/tmp/sqlglot-src} \
+		BLAST_MAP=$${BLAST_MAP:-/tmp/entry2-coverage.json} \
+		BLAST_OBSERVED=$${BLAST_OBSERVED:-/tmp/entry2-observed.json} \
 		python3 selector.py > $(OUTPUT)
 	python3 ../blast-radius-sample/score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)

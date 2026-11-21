@@ -1,392 +1,546 @@
-"""Choose the sqlglot tests a patch can break, using a coverage map of the pinned commit.
-
-A miss costs far more than an extra test, so a changed line pulls in every test
-that executes it. Class and module assignments also pull in tests that execute
-a reference to the assigned name, because those lines run at import time and
-are not attributed to the tests that later read them.
-"""
-
-from __future__ import annotations
-
+"""Select tests for stand-alone patches against the pinned SQLGlot checkout."""
 import ast
+import bisect
+import importlib
 import json
 import os
-import struct
+import re
+import resource
+import signal
 import sys
+import tempfile
+import time
+import unittest
+from collections import defaultdict
 from pathlib import Path
 
-from analyze import (
-    assigned_names,
-    build_fixture_index,
-    build_import_graph,
-    functions_and_classes,
-    lines_mentioning,
-    module_name,
-    python_code,
-    statement_at,
-    tests_reaching,
-    tightest,
-)
-from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
-from edits import boundary_unreachable, data_only, identity_swap, loaded_mentions, proven_readers
-from pack import pack
+from escape_map import changed_keys
+from inline_pool import InlinePool
+from observe import REPLACEMENTS, identity_site
 
-DATA = Path(os.environ.get("DATA_DIR", "/data"))
-ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))
-COVERAGE_MAP = Path(os.environ.get("COVERAGE_MAP", "/app/maps/coverage.bin"))
-# A reference line executed by this many tests is a shared helper, not a signal
-# that those tests depend on the particular class attribute that changed.
-HOT_REFERENCE = 40
+HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+MAX_PROBE_MS = 850
 
 
-def load_coverage(path: Path, numbers: dict[str, int]) -> dict[str, dict[int, set[int]]]:
-    """File -> line -> test numbers. Coverage indices are translated to tests.json."""
-    blob = path.read_bytes()
-    if blob[:4] != b"BRC1":
-        raise SystemExit(f"bad coverage map: {path}")
-    offset = 4
-    (count,) = struct.unpack_from("<I", blob, offset)
-    offset += 4
-    nodeids: list[str] = []
-    for _ in range(count):
-        (length,) = struct.unpack_from("<H", blob, offset)
-        offset += 2
-        nodeids.append(blob[offset : offset + length].decode("utf-8"))
-        offset += length
-    (file_count,) = struct.unpack_from("<I", blob, offset)
-    offset += 4
-    lines: dict[str, dict[int, set[int]]] = {}
-    for _ in range(file_count):
-        (length,) = struct.unpack_from("<H", blob, offset)
-        offset += 2
-        relative = blob[offset : offset + length].decode("utf-8")
-        offset += length
-        (line_count,) = struct.unpack_from("<I", blob, offset)
-        offset += 4
-        by_line: dict[int, set[int]] = {}
-        for _line in range(line_count):
-            lineno, owners = struct.unpack_from("<IH", blob, offset)
-            offset += 6
-            if owners:
-                raw = struct.unpack_from(f"<{owners}H", blob, offset)
-                offset += 2 * owners
-            else:
-                raw = ()
-            translated = {numbers[nodeids[index]] for index in raw if nodeids[index] in numbers}
-            if translated:
-                by_line[lineno] = translated
-        if by_line:
-            lines[relative] = by_line
-    return lines
+def changes(root, diff):
+    """Apply ordinary Git unified hunks in memory, validating old context."""
+    result = {}
+    current = None
+    lines = iter(diff.splitlines(keepends=True))
+    for line in lines:
+        if line.startswith("diff --git "):
+            current = None
+        elif line.startswith("--- a/"):
+            path = line[6:].rstrip("\n")
+            if next(lines).rstrip("\n") != "+++ b/" + path:
+                raise ValueError("Unsupported diff path")
+            relative = Path(path)
+            if relative.is_absolute() or ".." in relative.parts or path in result:
+                raise ValueError("Unexpected diff path")
+            old = (root / path).read_text().splitlines(keepends=True)
+            result[path] = current = (old, [], set(), set())
+        elif line.startswith("@@"):
+            if current is None or not (match := HUNK.match(line)):
+                raise ValueError("Unsupported hunk")
+            old, hunks, deleted, inserted = current
+            start, old_count, _, new_count = match.groups()
+            old_count, new_count = int(old_count or 1), int(new_count or 1)
+            cursor = int(start) - bool(old_count)
+            initial = cursor
+            replacement = []
+            while old_count or new_count:
+                edit = next(lines)
+                mode, body = edit[0], edit[1:]
+                if mode in " -":
+                    if old[cursor] != body:
+                        raise ValueError("Original patch context differs")
+                    cursor += 1
+                    old_count -= 1
+                if mode in " +":
+                    replacement.append(body)
+                    new_count -= 1
+                if mode == "-":
+                    deleted.add(cursor)
+                if mode == "+":
+                    inserted.add(cursor)
+                if mode not in " +-" or min(old_count, new_count) < 0:
+                    raise ValueError("Unsupported patch line")
+            hunks.append((initial, cursor, replacement))
+        elif line.startswith(("Binary files ", "GIT binary patch", "--- ", "\\ No newline")):
+            raise ValueError("Unsupported patch format")
+    if not result or any(not h for _, h, _, _ in result.values()):
+        raise ValueError("No supported hunks")
+    output = {}
+    for path, (old, hunks, deleted, inserted) in result.items():
+        new = old.copy()
+        for start, end, replacement in reversed(hunks):
+            new[start:end] = replacement
+        output[path] = ("".join(old), "".join(new), deleted, inserted)
+    return output
 
 
-def tests_on_lines(coverage: dict[str, dict[int, set[int]]], relative: str, start: int, end: int) -> set[int]:
-    by_line = coverage.get(relative, {})
-    selected: set[int] = set()
-    for lineno in range(start, end + 1):
-        selected.update(by_line.get(lineno, ()))
-    return selected
+def last_leq(ordered, high):
+    return bisect.bisect_right(ordered, high) - 1
 
 
-def tests_touching(coverage: dict[str, dict[int, set[int]]], relative: str) -> set[int]:
-    selected: set[int] = set()
-    for owners in coverage.get(relative, {}).values():
-        selected.update(owners)
-    return selected
+def overlaps(ordered, low, high):
+    end = last_leq(ordered, high)
+    return end >= 0 and ordered[end] >= low
 
 
-def _start(node: ast.AST) -> int:
-    start = getattr(node, "lineno", 1) or 1
-    decorators = getattr(node, "decorator_list", None) or []
-    if decorators:
-        start = min(start, min(item.lineno for item in decorators))
-    return start
+def regions(tree, deleted, inserted):
+    """Map old diff coordinates to enclosing executable statements."""
+    statements = [node for node in ast.walk(tree) if isinstance(node, ast.stmt)]
+    intervals = set()
+    for line in deleted | inserted:
+        owners = [n for n in statements if n.lineno <= line <= n.end_lineno]
+        if not owners:
+            return None
+        owner = min(owners, key=lambda n: (n.end_lineno - n.lineno, -n.col_offset))
+        # Header and decorator changes can affect tests which call the definition.
+        end = owner.end_lineno
+        if isinstance(owner, (ast.If, ast.For, ast.While, ast.With, ast.Match, ast.AsyncFor, ast.AsyncWith)):
+            body = owner.cases if isinstance(owner, ast.Match) else owner.body
+            end = min(end, max(line, body[0].lineno - 1)) if not isinstance(owner, ast.Match) else end
+        intervals.add((owner.lineno, end))
+    return intervals
 
 
-def _end(node: ast.AST) -> int:
-    return getattr(node, "end_lineno", None) or _start(node)
-
-
-def _signature(function: ast.AST, line: int) -> bool:
-    body = getattr(function, "body", None) or []
-    body_start = body[0].lineno if body else _start(function) + 1
-    return _start(function) <= line < body_start
-
-
-class Selector:
-    def __init__(self, root: Path, coverage: dict[str, dict[int, set[int]]], catalog: list[dict]) -> None:
+class Impact:
+    def __init__(self, tests, baseline, root, escapes):
+        self.tests = tests
         self.root = root
-        self.coverage = coverage
-        self.by_node = {test["id"]: test["number"] for test in catalog}
-        self.by_file: dict[str, list[int]] = {}
-        self.test_modules: dict[str, list[str]] = {}
-        for test in catalog:
-            self.by_file.setdefault(test["file"], []).append(test["number"])
-            self.test_modules.setdefault(module_name(test["file"]), []).append(test["id"])
-        self.fixtures = build_fixture_index(root)
-        self.imports = build_import_graph(root)
-        self._mentions: dict[str, list[tuple[str, int]] | None] = {}
-
-    def mentions(self, name: str) -> list[tuple[str, int]] | None:
-        if name not in self._mentions:
-            self._mentions[name] = lines_mentioning(self.root, name)
-        return self._mentions[name]
-
-    def numbers_for(self, node_ids: set[str]) -> set[int]:
-        return {self.by_node[node_id] for node_id in node_ids if node_id in self.by_node}
-
-    def importers_of(self, relative: str) -> set[int]:
-        return self.numbers_for(tests_reaching(self.imports, self.test_modules, module_name(relative)))
-
-    def choose(self, patch_text: str) -> set[int]:
-        selected: set[int] = set()
-        for file_diff in parse_patch(patch_text):
-            selected |= self._file(file_diff)
-        return selected
-
-    def _file(self, file_diff: FileDiff) -> set[int]:
-        path = file_diff.path
-        if path is None or file_diff.binary:
-            return set()
-        if path.startswith("tests/") and path.endswith(".py"):
-            return self._test_python(file_diff, path)
-        if path.startswith("tests/"):
-            return self._fixture(path)
-        if path.endswith(".py") and (self.root / path).is_file():
-            return self._library_python(file_diff, path)
-        if not (self.root / path).exists() and path.endswith(".py"):
-            return self.importers_of(path) | tests_touching(self.coverage, path)
-        return set()
-
-    def _fixture(self, path: str) -> set[int]:
-        found = self.numbers_for(self.fixtures.get(path, set()))
-        if found:
-            return found
-        stem = Path(path).stem
-        if len(stem) < 6:
-            return set()
-        matched: set[int] = set()
-        for relative, numbers in self.by_file.items():
-            source = self.root / relative
-            if source.is_file() and stem in source.read_text(encoding="utf-8"):
-                matched.update(numbers)
-        return matched
-
-    def _test_python(self, file_diff: FileDiff, path: str) -> set[int]:
-        original = (self.root / path).read_text(encoding="utf-8") if (self.root / path).is_file() else ""
-        try:
-            patched = apply_hunks(original, file_diff.hunks) if file_diff.old_path else _added_text(file_diff)
-            new_tree = ast.parse(patched)
-        except (DiffApplyError, SyntaxError):
-            return set(self.by_file.get(path, ()))
-        if not original:
-            return set(self.by_file.get(path, ()))
-        old_tree = ast.parse(original)
-        if ast.dump(old_tree) == ast.dump(new_tree):
-            return set()
-        changed = _changed_test_names(old_tree, new_tree)
-        if changed is None:
-            return set(self.by_file.get(path, ()))
-        selected: set[int] = set()
-        for class_name, function_name in changed:
-            node_id = f"{path}::{class_name}::{function_name}" if class_name else f"{path}::{function_name}"
-            if node_id in self.by_node:
-                selected.add(self.by_node[node_id])
-        return selected or set(self.by_file.get(path, ()))
-
-    def _library_python(self, file_diff: FileDiff, path: str) -> set[int]:
-        original_path = self.root / (file_diff.old_path or path)
-        if file_diff.old_path is None:
-            return self.importers_of(path)
-        if file_diff.new_path is None:
-            return self.importers_of(file_diff.old_path) | tests_touching(self.coverage, file_diff.old_path)
-        original = original_path.read_text(encoding="utf-8")
-        try:
-            patched = apply_hunks(original, file_diff.hunks)
-        except DiffApplyError:
-            return self.importers_of(path) | tests_touching(self.coverage, path)
-        try:
-            new_tree = ast.parse(patched)
-        except SyntaxError:
-            return self.importers_of(path) | tests_touching(self.coverage, path)
-        old_tree = ast.parse(original)
-        if identity_swap(old_tree, new_tree) or boundary_unreachable(old_tree, new_tree):
-            return set()
-        # A value change does not send new tests into the line. Tests that
-        # never executed it cannot observe it. Control-flow edits stay wide.
-        narrow = data_only(old_tree, new_tree)
-        selected: set[int] = set()
-        removed = [(line, text) for line, text in removed_lines(file_diff.hunks) if python_code(text)]
-        added = [(line, text) for line, text in added_lines(file_diff.hunks) if python_code(text)]
-        for line, _text in removed:
-            selected |= self._old_line(path, old_tree, line, narrow)
-        if added and not removed:
-            selected |= self._insertion(path, old_tree, new_tree, [line for line, _text in added])
-        return selected
-
-    def _old_line(self, path: str, tree: ast.AST, line: int, narrow: bool) -> set[int]:
-        functions, classes = functions_and_classes(tree)
-        # Calling a lambda executes its body. Tests that only imported the class
-        # ran the header and did not see a value change inside the body.
-        if narrow:
-            lambda_node = tightest([node for node in ast.walk(tree) if isinstance(node, ast.Lambda)], line)
-            if lambda_node is not None:
-                start = lambda_node.lineno + 1 if line > lambda_node.lineno else line
-                selected = tests_on_lines(self.coverage, path, start, _end(lambda_node))
-                if selected:
-                    return selected
-        function = tightest(functions, line)
-        if function is not None and _signature(function, line):
-            selected = tests_on_lines(self.coverage, path, _start(function), _end(function))
-            return selected or tests_touching(self.coverage, path)
-        if function is not None:
-            statement = statement_at(tree, line)
-            if isinstance(statement, (ast.Import, ast.ImportFrom)):
-                return self.importers_of(path) | tests_touching(self.coverage, path)
-            if narrow:
-                selected = self.coverage.get(path, {}).get(line, set())
-                if selected:
-                    return set(selected)
-            start = statement.lineno if statement is not None else line
-            end = statement.end_lineno if statement is not None and statement.end_lineno else line
-            selected = tests_on_lines(self.coverage, path, start, end)
-            if not selected:
-                tail = tests_on_lines(self.coverage, path, line, _end(function))
-                if tail:
-                    return tail
-                return tests_on_lines(self.coverage, path, _start(function), _end(function))
-            return selected
-        return self._scope_name(path, tree, line, tightest(classes, line), narrow)
-
-    def _scope_name(
-        self, path: str, tree: ast.AST, line: int, class_node: ast.AST | None, narrow: bool
-    ) -> set[int]:
-        statement = statement_at(tree, line)
-        if isinstance(statement, (ast.Import, ast.ImportFrom)):
-            return self.importers_of(path) | tests_touching(self.coverage, path)
-        names = assigned_names(statement)
-        # Tests that never execute a line naming this assignment cannot observe
-        # its new value. A name on too many lines falls through to the file.
-        if len(names) == 1 and self.mentions(names[0]) is not None:
-            readers: set[int] = set()
-            shared = False
-            for relative, lineno in self.mentions(names[0]) or []:
-                owners = self.coverage.get(relative, {}).get(lineno, set())
-                if len(owners) > HOT_REFERENCE:
-                    shared = True
-                    break
-                readers |= owners
-            if readers and not shared:
-                # Drop tests that only stored the same name on another class.
-                # Tests that load it, including through a shared dialect helper, stay.
-                loaded = loaded_mentions(
-                    names[0], self.mentions, self.coverage, self.root, path, tree, line
-                )
-                kept = readers & loaded if loaded is not None else set()
-                if kept:
-                    return kept
-                return readers
-        useful = [name for name in names if self.mentions(name) is not None]
-        if class_node is not None and not useful:
-            class_name = class_node.name  # type: ignore[attr-defined]
-            if self.mentions(class_name) is not None:
-                useful.append(class_name)
-        selected: set[int] = tests_touching(self.coverage, path)
-        if class_node is not None:
-            selected |= tests_on_lines(self.coverage, path, _start(class_node), _end(class_node))
-        for name in useful:
-            for relative, lineno in self.mentions(name) or []:
-                owners = self.coverage.get(relative, {}).get(lineno, set())
-                if 0 < len(owners) <= HOT_REFERENCE:
-                    selected |= owners
-        if narrow and len(names) == 1 and selected:
-            class_name = class_node.name if class_node is not None else None  # type: ignore[attr-defined]
-            proven = proven_readers(
-                names[0], class_name, self.mentions, self.coverage, self.root, HOT_REFERENCE
-            )
-            kept = selected & proven if proven is not None else set()
-            if kept:
-                return kept
-        return selected
-
-    def _insertion(self, path: str, old_tree: ast.AST, new_tree: ast.AST, lines: list[int]) -> set[int]:
-        selected: set[int] = set()
-        old_functions, old_classes = functions_and_classes(old_tree)
-        new_functions, new_classes = functions_and_classes(new_tree)
-        for line in lines:
-            function = tightest(new_functions, line)
-            if function is None:
-                selected |= self._scope_name(path, new_tree, line, tightest(new_classes, line), False)
+        self.references = {}
+        self.escapes = escapes
+        self.numbers = {test["id"]: test["number"] for test in tests}
+        self.all = {t["number"] for t in tests}
+        self.cover = defaultdict(list)
+        self.readers = defaultdict(set)
+        self.unknown = set()
+        for test in tests:
+            number = test["number"]
+            if test["id"] not in baseline["tests"]:
+                self.unknown.add(number)
                 continue
-            class_node = tightest(new_classes, line)
-            class_name = class_node.name if class_node is not None else None  # type: ignore[attr-defined]
-            match = _same_function(old_functions, old_classes, function.name, class_name)  # type: ignore[attr-defined]
-            if match is None:
-                selected |= tests_touching(self.coverage, path)
-            else:
-                selected |= tests_on_lines(self.coverage, path, _start(match), _end(match))
+            executed, reads = baseline["tests"][test["id"]]
+            for path, lines in executed.items():
+                self.cover[path].append((number, lines))
+            for path in reads:
+                self.readers[path].add(number)
+        self.collection, self.collection_reads = baseline["collection"]
+        self.source_sensitive = set()
+        checked = {}
+        source_pattern = re.compile(r"\b(?:getsource|getlines|co_firstlineno|read_text|traceback)\b")
+        for test in tests:
+            path = root / test["file"]
+            if path not in checked:
+                checked[path] = path.is_file() and bool(source_pattern.search(path.read_text()))
+            if checked[path]:
+                self.source_sensitive.add(test["number"])
+        self.direct_config_readers = {
+            path for path in {t["file"] for t in tests}
+            if (root / path).is_file() and "NUMERIC_ESCAPES" in (root / path).read_text()
+        }
+
+    def reference_tests(self, symbols):
+        key = tuple(sorted(symbols))
+        if key not in self.references:
+            name = re.compile(r"\b(?:" + "|".join(map(re.escape, key)) + r")\b")
+            matched = set()
+            for path, covered in self.cover.items():
+                if not path.endswith(".py"):
+                    continue
+                source = (self.root / path).read_text()
+                lines = {n for n, line in enumerate(source.splitlines(), 1) if name.search(line)}
+                if lines:
+                    matched.update(test for test, executed in covered if lines.intersection(executed))
+            self.references[key] = matched
+        return self.references[key]
+
+    def candidates(self, edits):
+        selected = set(self.unknown)
+        for path, (before, after, deleted, inserted) in edits.items():
+            selected.update(self.readers[path])
+            if path in self.collection_reads:
+                return self.all
+            if path.startswith("tests/fixtures/"):
+                if not self.readers[path]:
+                    return self.all
+                continue
+            if not path.endswith(".py") or not path.startswith(("sqlglot/", "tests/")):
+                return self.all
+            try:
+                old = ast.parse(before, type_comments=True)
+                new = ast.parse(after, type_comments=True)
+            except SyntaxError:
+                return self.all
+            if path in self.escapes and len(edits) == 1 and (keys := changed_keys(old, new)) is not None:
+                for key in keys:
+                    selected.update(self.numbers[node] for node in self.escapes[path].get(key, [])
+                                    if node in self.numbers)
+                selected.update(n for n in self.reference_tests({"NUMERIC_ESCAPES"})
+                                if self.tests[n]["file"] in self.direct_config_readers)
+                continue
+            if path.startswith("tests/"):
+                selected.update(t["number"] for t in self.tests if t["file"] == path)
+            affected = regions(old, deleted, inserted)
+            if ast.dump(old) == ast.dump(new):
+                # Scope source-text/line-number readers conservatively. Ordinary
+                # comments do not enter Python's executable syntax tree.
+                selected.update(self.source_sensitive)
+                continue
+            if affected is None:
+                return self.all
+            declarations = declaration_symbols(old, affected)
+            if declarations:
+                references = self.reference_tests(declarations)
+                parts = Path(path).parts
+                dialect = Path(path).stem
+                dialect_consumers = self.readers["dialect:" + dialect]
+                if parts[1] in {"dialects", "parsers", "generators", "typing"} and dialect_consumers:
+                    references = references & dialect_consumers
+                    references |= {n for n, _ in self.cover[path]}
+                selected.update(references)
+            collection = self.collection.get(path, [])
+            if not declarations and any(overlaps(collection, lo, hi) for lo, hi in affected):
+                return self.all
+            for number, executed in self.cover[path]:
+                if any(overlaps(executed, lo, hi) for lo, hi in affected):
+                    selected.add(number)
         return selected
 
 
-def _same_function(
-    functions: list[ast.AST], classes: list[ast.AST], name: str, class_name: str | None
-) -> ast.AST | None:
-    for function in functions:
-        if function.name != name:  # type: ignore[attr-defined]
+def comparison_edits(edits):
+    """Identify patches consisting solely of supported comparison changes."""
+    sites = []
+    operator_text = re.compile(r"\bis\b|[<>]")
+    for path, (before, after, removed, _) in edits.items():
+        if not path.startswith("sqlglot/") or not path.endswith(".py") or not removed:
+            return []
+        old_lines = before.split("\n")
+        if not any(operator_text.search(old_lines[line - 1]) for line in removed):
+            return []
+        try:
+            old = ast.parse(before, type_comments=True)
+            new = ast.parse(after, type_comments=True)
+        except SyntaxError:
+            return []
+        old_nodes = [n for n in ast.walk(old) if isinstance(n, ast.Compare)]
+        new_nodes = [n for n in ast.walk(new) if isinstance(n, ast.Compare)]
+        if len(old_nodes) != len(new_nodes):
+            return []
+        for previous, current in zip(old_nodes, new_nodes):
+            if len(previous.ops) != 1 or len(current.ops) != 1:
+                continue
+            op = type(previous.ops[0]).__name__
+            replacement = REPLACEMENTS.get(op)
+            if not replacement or replacement[0] != type(current.ops[0]).__name__:
+                continue
+            if op in ("Is", "IsNot") and not identity_site(previous):
+                continue
+            sites.append((path, previous.lineno, previous.end_lineno,
+                          f"{path}:{previous.lineno}:{previous.col_offset}"))
+            current.ops = previous.ops
+        if ast.dump(old) != ast.dump(new):
+            return []
+    return sites
+
+
+def exclude_equivalent(candidates, edits, observations, impact):
+    if not observations or not candidates:
+        return candidates
+    sites = comparison_edits(edits)
+    if not sites:
+        return candidates
+    # Startup observations can affect later tests through shared state.
+    if any(observations.get(key, {}).get("") is False for _, _, _, key in sites):
+        return candidates
+    eligible = candidates - impact.unknown - impact.source_sensitive
+    for path in edits:
+        eligible.difference_update(impact.readers[path])
+    confirmed = set(eligible)
+    for path, first, last, key in sites:
+        evidence = observations.get(key, {})
+        if overlaps(impact.collection.get(path, ()), first, last) and evidence.get("") is not True:
+            return candidates
+        covered = {n for n, lines in impact.cover[path] if overlaps(lines, first, last)}
+        matching = {n for n in eligible if evidence.get(impact.tests[n]["id"]) is True}
+        if not matching:
+            return candidates
+        # A test listed by the scope-level filter may never reach this expression.
+        # Only waive that site when neither collector saw the line or its operands.
+        unobserved = {n for n in eligible - covered if impact.tests[n]["id"] not in evidence}
+        confirmed.intersection_update(matching | unobserved)
+    return candidates - confirmed
+
+
+def declaration_symbols(tree, affected):
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
             continue
-        parent = tightest(classes, function.lineno)  # type: ignore[attr-defined]
-        parent_name = parent.name if parent is not None else None  # type: ignore[attr-defined]
-        if parent_name == class_name:
-            return function
-    return None
+        for statement in node.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            if not any(statement.lineno <= hi and lo <= statement.end_lineno for lo, hi in affected):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            if any(isinstance(base, ast.Name) and base.id in {"Expression", "Expr"} for base in node.bases):
+                names.add(node.name)
+            else:
+                names.update(t.id for t in targets if isinstance(t, ast.Name))
+    return names
 
 
-def _changed_test_names(old_tree: ast.AST, new_tree: ast.AST) -> set[tuple[str | None, str]] | None:
-    """Changed test methods, or None when a helper or class body changed too."""
-    old_map = _test_dumps(old_tree)
-    new_map = _test_dumps(new_tree)
-    if _dump_without_tests(old_tree) != _dump_without_tests(new_tree):
-        return None
-    changed = {key for key in old_map.keys() | new_map.keys() if old_map.get(key) != new_map.get(key)}
-    return changed
+def overlay(base, dest, edits):
+    """Link unchanged paths and write patched files into a tiny temp tree."""
+    for entry in base.iterdir():
+        here = dest / entry.name
+        if entry.name in edits:
+            here.write_text(edits[entry.name][1])
+            continue
+        nested = {path.split("/", 1)[1]: change for path, change in edits.items()
+                  if path.startswith(entry.name + "/")}
+        if nested:
+            here.mkdir()
+            overlay(entry, here, nested)
+        else:
+            here.symlink_to(entry, target_is_directory=entry.is_dir())
 
 
-def _test_dumps(tree: ast.AST) -> dict[tuple[str | None, str], str]:
-    found: dict[tuple[str | None, str], str] = {}
-    for node in tree.body:  # type: ignore[attr-defined]
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test"):
-                    found[(node.name, item.name)] = ast.dump(item, include_attributes=False)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-            found[(None, node.name)] = ast.dump(node, include_attributes=False)
-    return found
+class ProbeResult(unittest.TestResult):
+    def __init__(self):
+        super().__init__()
+        self.failed = set()
+        self.active = None
+
+    def startTest(self, test):
+        self.active = test.id()
+        super().startTest(test)
+        signal.setitimer(signal.ITIMER_REAL, 0.75)
+
+    def stopTest(self, test):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        self.active = None
+        super().stopTest(test)
+
+    def addError(self, test, exc):
+        self.failed.add(test.id())
+
+    addFailure = addError
+
+    def addUnexpectedSuccess(self, test):
+        self.failed.add(test.id())
+
+    def addSubTest(self, test, subtest, exc):
+        if exc:
+            self.failed.add(test.id())
+            raise unittest.case._ShouldStop
 
 
-def _dump_without_tests(tree: ast.AST) -> str:
-    clone = ast.parse(ast.unparse(tree)) if hasattr(ast, "unparse") else tree
-    # Compare everything except test-method bodies by blanking those bodies.
-    for node in ast.walk(clone):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-            node.body = [ast.Pass()]
-    return ast.dump(clone, include_attributes=False)
+def timeout(*_):
+    raise TimeoutError("probe deadline")
 
 
-def _added_text(file_diff: FileDiff) -> str:
-    return "\n".join(text for _line, text in added_lines(file_diff.hunks)) + "\n"
+def job_impact(edits):
+    regions_by_path = {}
+    for path, (before, after, deleted, inserted) in edits.items():
+        if path.startswith("tests/fixtures/"):
+            continue
+        if not path.startswith("sqlglot/") or not path.endswith(".py"):
+            return None
+        old, new = ast.parse(before), ast.parse(after)
+        if ast.dump(old) == ast.dump(new):
+            continue
+        affected = regions(old, deleted, inserted)
+        if not affected:
+            return None
+        # Untracked initializer or declaration effects invalidate all entries.
+        def functions_contain(low, high):
+            return any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                       and n.body[0].lineno <= low <= high <= n.end_lineno
+                       for n in ast.walk(old))
+        if not all(functions_contain(lo, hi) for lo, hi in affected):
+            return None
+        regions_by_path[path] = affected
+
+    def affected(covered):
+        return any(overlaps(covered.get(path, ()), lo, hi)
+                   for path, intervals in regions_by_path.items() for lo, hi in intervals)
+
+    return affected
 
 
-def main() -> None:
-    catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
-    numbers = {test["id"]: test["number"] for test in catalog}
-    seconds = {test["number"]: float(test["seconds"]) for test in catalog}
-    coverage = load_coverage(COVERAGE_MAP, numbers)
-    selector = Selector(ROOT, coverage, catalog)
-    commits = sorted((DATA / "commits").glob("*.patch"))
-    for patch in commits:
-        selected = selector.choose(patch.read_text(encoding="utf-8"))
-        print(json.dumps({"commit": patch.stem, "workers": pack(selected, seconds)}, separators=(",", ":")))
-        print(f"{patch.stem}: {len(selected)} tests", file=sys.stderr)
+def probe(tests, edits):
+    InlinePool.impact = job_impact(edits)
+    """Run base-suite unittest cases with their class and module lifecycle."""
+    signal.signal(signal.SIGALRM, timeout)
+    for path in edits:
+        if path.startswith("sqlglot/") and path.endswith(".py"):
+            module = path.removesuffix(".py").removesuffix("/__init__").replace("/", ".")
+            try:
+                importlib.import_module(module)
+            except Exception:
+                return set(), {"*"}
+    names = {}
+    cases = []
+    failed_files = set()
+    provisional = set()
+    for test in tests:
+        file, *parts = test["id"].split("::")
+        module = file.removesuffix(".py").replace("/", ".")
+        try:
+            imported = importlib.import_module(module)
+        except Exception:
+            failed_files.add(file)
+            continue
+        if hasattr(imported, "ProcessPoolExecutor"):
+            imported.ProcessPoolExecutor = InlinePool
+        if len(parts) != 2 or test["ms"] > MAX_PROBE_MS:
+            provisional.add(test["number"])
+            continue
+        cls = getattr(imported, parts[0], None)
+        if not isinstance(cls, type) or not issubclass(cls, unittest.TestCase):
+            provisional.add(test["number"])
+            continue
+        try:
+            case = cls(parts[1])
+        except Exception:
+            provisional.add(test["number"])
+            continue
+        cases.append(case)
+        names[case.id()] = test["number"]
+
+    result = ProbeResult()
+    unittest.TestSuite(cases).run(result)
+    failed = {names[name] for name in result.failed if name in names}
+    for name in result.failed - names.keys():
+        # unittest uses string IDs such as setUpClass (tests.foo.Class).
+        target = name.rsplit("(", 1)[-1].removesuffix(")")
+        failed.update(number for case, number in names.items() if case.startswith(target + "."))
+    return failed | provisional, failed_files
+
+
+def verify(root, edits, tests):
+    """Use a fresh process namespace for each patch and capture test stdout."""
+    with tempfile.TemporaryDirectory(prefix="blast-") as folder:
+        folder = Path(folder)
+        tree = folder / "checkout"
+        tree.mkdir()
+        overlay(root, tree, edits)
+        result_path = folder / "result.json"
+        pid = os.fork()
+        if pid == 0:
+            try:
+                with open(os.devnull, "w") as silence:
+                    os.dup2(silence.fileno(), 1)
+                    os.dup2(silence.fileno(), 2)
+                os.setsid()
+                os.chdir(tree)
+                sys.path.insert(0, str(tree))
+                chosen, errors = probe(tests, edits)
+                result_path.write_text(json.dumps([sorted(chosen), sorted(errors)]))
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        deadline = time.monotonic() + 3.0
+        while not os.waitpid(pid, os.WNOHANG)[0]:
+            if time.monotonic() >= deadline:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                break
+            time.sleep(0.005)
+        if result_path.exists():
+            return json.loads(result_path.read_text())
+        return [t["number"] for t in tests], []
+
+
+def split(chosen, durations):
+    if not chosen:
+        return []
+    jobs = sorted(chosen, key=lambda number: (-durations[number], number))
+    total = sum(durations[j] for j in jobs)
+    longest = durations[jobs[0]]
+    best_cost, best = total + 2000, [jobs]
+    for k in range(2, min(8, len(jobs)) + 1):
+        fee = 2000 * k
+        if fee + longest >= best_cost:
+            break
+        if fee + (total + k - 1) // k >= best_cost:
+            continue
+        groups = [[job] for job in jobs[:k]]
+        loads = [durations[job] for job in jobs[:k]]
+        for job in jobs[k:]:
+            i = loads.index(min(loads))
+            loads[i] += durations[job]
+            groups[i].append(job)
+        cost = max(loads) + fee
+        if cost < best_cost:
+            best_cost, best = cost, groups
+    return best
+
+
+def schedule_cost(groups, durations):
+    return max((sum(durations[j] for j in g) for g in groups), default=0) + 2000 * len(groups)
+
+
+def cpu_time():
+    return sum(sum(resource.getrusage(who)[:2])
+               for who in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN))
+
+
+def main():
+    data = Path(os.environ.get("BLAST_DATA", "/data"))
+    root = Path(os.environ.get("BLAST_ROOT", "/sqlglot")).resolve()
+    tests = json.loads((data / "tests.json").read_text())["tests"]
+    for test in tests:
+        test["ms"] = round(test["seconds"] * 1000)
+    durations = {test["number"]: test["ms"] for test in tests}
+    map_path = Path(os.environ.get("BLAST_MAP", "/app/coverage.json"))
+    job_path = Path(os.environ.get("BLAST_JOBS", str(map_path) + ".jobs"))
+    if job_path.is_file():
+        InlinePool.baseline_jobs = json.loads(job_path.read_text())
+    observed_path = Path(os.environ.get("BLAST_OBSERVED", "/app/observed.json"))
+    observations = json.loads(observed_path.read_text()) if observed_path.exists() else {}
+    observed = observations.get("comparisons", {})
+    impact = Impact(tests, json.loads(map_path.read_text()), root,
+                    observations.get("escapes", {}))
+    full_schedule = split(impact.all, durations)
+    sys.dont_write_bytecode = True
+    importlib.import_module("pandas")
+    importlib.import_module("duckdb")
+    for patch in sorted((data / "commits").glob("*.patch")):
+        started = cpu_time() if os.environ.get("BLAST_STATS") else 0
+        candidates = set()
+        try:
+            edits = changes(root, patch.read_text())
+            candidates = exclude_equivalent(
+                impact.candidates(edits), edits, observed, impact
+            )
+            expensive = {n for n in candidates if durations[n] > MAX_PROBE_MS}
+            one_fixture_owner = len(candidates) == 1 and all(path.startswith("tests/fixtures/") for path in edits)
+            if one_fixture_owner or (expensive and schedule_cost(split(candidates, durations), durations) == schedule_cost(
+                split(expensive, durations), durations
+            )):
+                # Probing the rest cannot lower the cost while expensive tests
+                # remain in the plan. Keep all candidates in this case.
+                chosen = candidates
+            elif candidates:
+                chosen, errors = verify(root, edits, [t for t in tests if t["number"] in candidates])
+                chosen = set(chosen)
+                chosen.update(t["number"] for t in tests if "*" in errors or t["file"] in errors)
+            else:
+                chosen = set()
+        except (OSError, ValueError, IndexError, StopIteration):
+            chosen = impact.all
+        if os.environ.get("BLAST_STATS"):
+            print(f"{patch.stem}: {len(chosen)} selected (from {len(candidates)}) CPU {cpu_time()-started:.4f}", file=sys.stderr)
+        workers = full_schedule if chosen == impact.all else split(chosen, durations)
+        print(json.dumps({"commit": patch.stem, "workers": workers},
+                         separators=(",", ":")), flush=True)
 
 
 if __name__ == "__main__":
