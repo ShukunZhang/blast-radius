@@ -28,7 +28,7 @@ from analyze import (
     tightest,
 )
 from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
-from edits import class_number, harmless
+from edits import data_only, identity_swap
 from pack import pack
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -210,26 +210,31 @@ class Selector:
         except SyntaxError:
             return self.importers_of(path) | tests_touching(self.coverage, path)
         old_tree = ast.parse(original)
-        if harmless(old_tree, new_tree):
+        if identity_swap(old_tree, new_tree):
             return set()
+        # A value change does not send new tests into the line. Tests that
+        # never executed it cannot observe it. Control-flow edits stay wide.
+        narrow = data_only(old_tree, new_tree)
         selected: set[int] = set()
         removed = [(line, text) for line, text in removed_lines(file_diff.hunks) if python_code(text)]
         added = [(line, text) for line, text in added_lines(file_diff.hunks) if python_code(text)]
         for line, _text in removed:
-            selected |= self._old_line(path, old_tree, line)
+            selected |= self._old_line(path, old_tree, line, narrow)
         if added and not removed:
             selected |= self._insertion(path, old_tree, new_tree, [line for line, _text in added])
         return selected
 
-    def _old_line(self, path: str, tree: ast.AST, line: int) -> set[int]:
+    def _old_line(self, path: str, tree: ast.AST, line: int, narrow: bool) -> set[int]:
         functions, classes = functions_and_classes(tree)
-        # A class-level lambda is not a function; use its body, not the whole assignment.
-        lambda_node = tightest([node for node in ast.walk(tree) if isinstance(node, ast.Lambda)], line)
-        if lambda_node is not None:
-            start = lambda_node.lineno + 1 if line > lambda_node.lineno else line
-            selected = tests_on_lines(self.coverage, path, start, _end(lambda_node))
-            if selected:
-                return selected
+        # Calling a lambda executes its body. Tests that only imported the class
+        # ran the header and did not see a value change inside the body.
+        if narrow:
+            lambda_node = tightest([node for node in ast.walk(tree) if isinstance(node, ast.Lambda)], line)
+            if lambda_node is not None:
+                start = lambda_node.lineno + 1 if line > lambda_node.lineno else line
+                selected = tests_on_lines(self.coverage, path, start, _end(lambda_node))
+                if selected:
+                    return selected
         function = tightest(functions, line)
         if function is not None and _signature(function, line):
             selected = tests_on_lines(self.coverage, path, _start(function), _end(function))
@@ -238,12 +243,10 @@ class Selector:
             statement = statement_at(tree, line)
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 return self.importers_of(path) | tests_touching(self.coverage, path)
-            # A boolean operator only affects tests that enter that expression.
-            boolop = tightest([node for node in ast.walk(tree) if isinstance(node, ast.BoolOp)], line)
-            if boolop is not None:
-                selected = tests_on_lines(self.coverage, path, boolop.lineno, _end(boolop))
+            if narrow:
+                selected = self.coverage.get(path, {}).get(line, set())
                 if selected:
-                    return selected
+                    return set(selected)
             start = statement.lineno if statement is not None else line
             end = statement.end_lineno if statement is not None and statement.end_lineno else line
             selected = tests_on_lines(self.coverage, path, start, end)
@@ -256,20 +259,20 @@ class Selector:
         statement = statement_at(tree, line)
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             return self.importers_of(path) | tests_touching(self.coverage, path)
-        number_name = class_number(statement)
-        if number_name is not None and self.mentions(number_name) is not None:
-            # Shared dialect methods run this name for every dialect. Readers
-            # outside dialects/ are the tests that can observe one dialect's override.
-            selected = set()
-            for relative, lineno in self.mentions(number_name) or []:
-                if relative.startswith("sqlglot/dialects/"):
-                    continue
-                owners = self.coverage.get(relative, {}).get(lineno, set())
-                if 0 < len(owners) <= HOT_REFERENCE:
-                    selected |= owners
-            if selected:
-                return selected
         names = assigned_names(statement)
+        # Tests that never execute a line naming this assignment cannot observe
+        # its new value. A name on too many lines falls through to the file.
+        if len(names) == 1 and self.mentions(names[0]) is not None:
+            readers: set[int] = set()
+            shared = False
+            for relative, lineno in self.mentions(names[0]) or []:
+                owners = self.coverage.get(relative, {}).get(lineno, set())
+                if len(owners) > HOT_REFERENCE:
+                    shared = True
+                    break
+                readers |= owners
+            if readers and not shared:
+                return readers
         useful = [name for name in names if self.mentions(name) is not None]
         if class_node is not None and not useful:
             class_name = class_node.name  # type: ignore[attr-defined]

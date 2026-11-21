@@ -1,81 +1,67 @@
-"""Decide when a Python edit cannot change which tests fail."""
+"""Classify a Python edit from the two syntax trees.
+
+A file is skipped when the trees match, or the only change is `is` versus `==`. A data edit changes a value and
+leaves control flow alone, so only tests that executed the edited line can
+observe it. Any other edit keeps the wider coverage set.
+"""
 
 from __future__ import annotations
 
 import ast
 
-_COMPARE_SWAP = {
+
+# Identity and equality agree for the comparisons these swaps replace.
+_IDENTITY = {
     (ast.Is, ast.Eq),
     (ast.Eq, ast.Is),
     (ast.IsNot, ast.NotEq),
     (ast.NotEq, ast.IsNot),
-    (ast.Lt, ast.LtE),
-    (ast.LtE, ast.Lt),
-    (ast.Gt, ast.GtE),
-    (ast.GtE, ast.Gt),
-    (ast.Eq, ast.NotEq),
-    (ast.NotEq, ast.Eq),
 }
-_LITERALS = (ast.Dict, ast.List, ast.Tuple, ast.Set)
 
 
-def harmless(old: object, new: object, in_literal: bool = False) -> bool:
-    """Trees match except compare swaps, bool keyword flips, and literal int or bool edits."""
+def identity_swap(old: object, new: object) -> bool:
+    """Trees match, allowing only `is`/`==` and `is not`/`!=`."""
     if isinstance(old, list) and isinstance(new, list):
-        return len(old) == len(new) and all(harmless(left, right, in_literal) for left, right in zip(old, new))
-    if not isinstance(old, ast.AST) or not isinstance(new, ast.AST):
-        return old == new
+        return len(old) == len(new) and all(identity_swap(left, right) for left, right in zip(old, new))
+    if isinstance(old, ast.cmpop) and isinstance(new, ast.cmpop):
+        return type(old) is type(new) or (type(old), type(new)) in _IDENTITY
     if type(old) is not type(new):
         return False
-    if isinstance(old, ast.keyword) and isinstance(new, ast.keyword):
-        if old.arg != new.arg:
-            return False
-        left, right = old.value, new.value
-        both_bool = (
-            isinstance(left, ast.Constant)
-            and isinstance(right, ast.Constant)
-            and type(left.value) is bool
-            and type(right.value) is bool
-        )
-        return True if both_bool else harmless(left, right, False)
+    if not isinstance(old, ast.AST) or not isinstance(new, ast.AST):
+        return old == new
+    return all(identity_swap(getattr(old, name), getattr(new, name)) for name in old._fields)
+
+
+def data_only(old: object, new: object) -> bool:
+    """True when the only differences are constants that are not conditions.
+
+    A test that never executed that constant in the old file still cannot
+    observe it, because the edit does not change which branch runs.
+    """
+    return _data(old, new, conditional=False)
+
+
+def _data(old: object, new: object, conditional: bool) -> bool:
+    if type(old) is not type(new):
+        return False
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and all(_data(left, right, conditional) for left, right in zip(old, new))
+    if not isinstance(old, ast.AST) or not isinstance(new, ast.AST):
+        return old == new
     if isinstance(old, ast.Constant):
-        same = old.value == new.value
-        return same or (in_literal and type(old.value) is type(new.value) and type(old.value) in (int, bool))
+        return old.value == new.value or not conditional
     for name in old._fields:
         left, right = getattr(old, name), getattr(new, name)
-        if name == "ops" and isinstance(old, ast.Compare):
-            if not _ops_equivalent(left, right):
-                return False
-            continue
+        child = conditional or _condition_field(old, name)
         if isinstance(left, (ast.AST, list)):
-            if not harmless(left, right, isinstance(old, _LITERALS)):
+            if not _data(left, right, child):
                 return False
         elif left != right:
             return False
     return True
 
 
-def _ops_equivalent(old_ops: list[ast.cmpop], new_ops: list[ast.cmpop]) -> bool:
-    if len(old_ops) != len(new_ops):
-        return False
-    for old_op, new_op in zip(old_ops, new_ops):
-        if type(old_op) is type(new_op):
-            continue
-        if (type(old_op), type(new_op)) not in _COMPARE_SWAP:
-            return False
-    return True
-
-
-def class_number(statement: ast.AST | None) -> str | None:
-    """Name of a class attribute assigned a plain integer, such as WEEK_OFFSET = -1."""
-    if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
-        return None
-    target = statement.targets[0]
-    if not isinstance(target, ast.Name):
-        return None
-    value = statement.value
-    if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.USub):
-        value = value.operand
-    if isinstance(value, ast.Constant) and type(value.value) is int:
-        return target.id
-    return None
+def _condition_field(node: ast.AST, name: str) -> bool:
+    if name == "test" and isinstance(node, (ast.If, ast.While, ast.Assert, ast.IfExp)):
+        return True
+    return name == "ifs" and isinstance(node, ast.comprehension)
