@@ -10,7 +10,7 @@ RUN tar -xzf /tmp/sqlglot.tar.gz -C /opt \
     && chmod -R a+rX /opt/sqlglot
 
 WORKDIR /app
-COPY selector.py analyze.py diffutil.py pack.py /app/
+COPY selector.py analyze.py diffutil.py edits.py pack.py /app/
 COPY maps /app/maps
 RUN chmod -R a+rX /app
 

@@ -28,6 +28,7 @@ from analyze import (
     tightest,
 )
 from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
+from edits import class_number, harmless
 from pack import pack
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -209,7 +210,7 @@ class Selector:
         except SyntaxError:
             return self.importers_of(path) | tests_touching(self.coverage, path)
         old_tree = ast.parse(original)
-        if ast.dump(old_tree, include_attributes=False) == ast.dump(new_tree, include_attributes=False):
+        if harmless(old_tree, new_tree):
             return set()
         selected: set[int] = set()
         removed = [(line, text) for line, text in removed_lines(file_diff.hunks) if python_code(text)]
@@ -222,6 +223,13 @@ class Selector:
 
     def _old_line(self, path: str, tree: ast.AST, line: int) -> set[int]:
         functions, classes = functions_and_classes(tree)
+        # A class-level lambda is not a function; use its body, not the whole assignment.
+        lambda_node = tightest([node for node in ast.walk(tree) if isinstance(node, ast.Lambda)], line)
+        if lambda_node is not None:
+            start = lambda_node.lineno + 1 if line > lambda_node.lineno else line
+            selected = tests_on_lines(self.coverage, path, start, _end(lambda_node))
+            if selected:
+                return selected
         function = tightest(functions, line)
         if function is not None and _signature(function, line):
             selected = tests_on_lines(self.coverage, path, _start(function), _end(function))
@@ -230,6 +238,12 @@ class Selector:
             statement = statement_at(tree, line)
             if isinstance(statement, (ast.Import, ast.ImportFrom)):
                 return self.importers_of(path) | tests_touching(self.coverage, path)
+            # A boolean operator only affects tests that enter that expression.
+            boolop = tightest([node for node in ast.walk(tree) if isinstance(node, ast.BoolOp)], line)
+            if boolop is not None:
+                selected = tests_on_lines(self.coverage, path, boolop.lineno, _end(boolop))
+                if selected:
+                    return selected
             start = statement.lineno if statement is not None else line
             end = statement.end_lineno if statement is not None and statement.end_lineno else line
             selected = tests_on_lines(self.coverage, path, start, end)
@@ -242,6 +256,19 @@ class Selector:
         statement = statement_at(tree, line)
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             return self.importers_of(path) | tests_touching(self.coverage, path)
+        number_name = class_number(statement)
+        if number_name is not None and self.mentions(number_name) is not None:
+            # Shared dialect methods run this name for every dialect. Readers
+            # outside dialects/ are the tests that can observe one dialect's override.
+            selected = set()
+            for relative, lineno in self.mentions(number_name) or []:
+                if relative.startswith("sqlglot/dialects/"):
+                    continue
+                owners = self.coverage.get(relative, {}).get(lineno, set())
+                if 0 < len(owners) <= HOT_REFERENCE:
+                    selected |= owners
+            if selected:
+                return selected
         names = assigned_names(statement)
         useful = [name for name in names if self.mentions(name) is not None]
         if class_node is not None and not useful:
