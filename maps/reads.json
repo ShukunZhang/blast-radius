@@ -1,0 +1,83 @@
+{
+ "eager": [
+  "sqlglot/__init__.py",
+  "sqlglot/_typing.py",
+  "sqlglot/dialects/__init__.py",
+  "sqlglot/dialects/dialect.py",
+  "sqlglot/diff.py",
+  "sqlglot/errors.py",
+  "sqlglot/expressions/__init__.py",
+  "sqlglot/expressions/aggregate.py",
+  "sqlglot/expressions/array.py",
+  "sqlglot/expressions/builders.py",
+  "sqlglot/expressions/constraints.py",
+  "sqlglot/expressions/core.py",
+  "sqlglot/expressions/datatypes.py",
+  "sqlglot/expressions/ddl.py",
+  "sqlglot/expressions/dml.py",
+  "sqlglot/expressions/functions.py",
+  "sqlglot/expressions/json.py",
+  "sqlglot/expressions/math.py",
+  "sqlglot/expressions/properties.py",
+  "sqlglot/expressions/query.py",
+  "sqlglot/expressions/string.py",
+  "sqlglot/expressions/temporal.py",
+  "sqlglot/generator.py",
+  "sqlglot/helper.py",
+  "sqlglot/jsonpath.py",
+  "sqlglot/optimizer/__init__.py",
+  "sqlglot/optimizer/scope.py",
+  "sqlglot/parser.py",
+  "sqlglot/parsers/__init__.py",
+  "sqlglot/parsers/base.py",
+  "sqlglot/schema.py",
+  "sqlglot/time.py",
+  "sqlglot/tokenizer_core.py",
+  "sqlglot/tokens.py",
+  "sqlglot/trie.py",
+  "sqlglot/typing/__init__.py"
+ ],
+ "tests": {
+  "tests/dialects/test_dialect.py::TestDialect::test_lazy_load": {
+   "reads": [],
+   "spawns_sqlglot": true
+  },
+  "tests/test_sqlglotc.py::TestSQLGlotC::test_build_removes_obsolete_extensions": {
+   "reads": [
+    "sqlglotc/setup.py"
+   ],
+   "spawns_sqlglot": false
+  },
+  "tests/test_sqlglotc.py::TestSQLGlotC::test_dry_run_preserves_obsolete_extensions": {
+   "reads": [
+    "sqlglotc/setup.py"
+   ],
+   "spawns_sqlglot": false
+  },
+  "tests/test_sqlglotc.py::TestSQLGlotC::test_editable_install_removes_obsolete_extensions": {
+   "reads": [
+    "sqlglotc/setup.py"
+   ],
+   "spawns_sqlglot": false
+  },
+  "tests/test_typing.py::TestTyping::test_no_redundant_expression_metadata": {
+   "reads": [
+    "sqlglot/typing/bigquery.py",
+    "sqlglot/typing/clickhouse.py",
+    "sqlglot/typing/databricks.py",
+    "sqlglot/typing/duckdb.py",
+    "sqlglot/typing/hive.py",
+    "sqlglot/typing/mysql.py",
+    "sqlglot/typing/postgres.py",
+    "sqlglot/typing/presto.py",
+    "sqlglot/typing/redshift.py",
+    "sqlglot/typing/snowflake.py",
+    "sqlglot/typing/spark.py",
+    "sqlglot/typing/spark2.py",
+    "sqlglot/typing/sqlite.py",
+    "sqlglot/typing/tsql.py"
+   ],
+   "spawns_sqlglot": false
+  }
+ }
+}

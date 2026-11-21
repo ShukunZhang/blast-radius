@@ -17,8 +17,6 @@ from pathlib import Path
 
 from analyze import (
     assigned_names,
-    build_fixture_index,
-    build_import_graph,
     functions_and_classes,
     lines_mentioning,
     module_name,
@@ -32,18 +30,25 @@ from edits import (
     boundary_unreachable,
     changed_dict_key,
     data_only,
-    enum_names,
     identity_swap,
     loaded_mentions,
     neutral_identity,
     proven_readers,
 )
+from class_reads import changed_dict_keys
+from class_users import ClassUsers
+from helper_edits import changed_helper_names, dependent_files
 from pack import pack
+import startup_cache
 from probe_small import confirm, should_probe
+from uncovered import UncoveredTests
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))
 COVERAGE_MAP = Path(os.environ.get("COVERAGE_MAP", "/app/maps/coverage.bin"))
+READS_MAP = Path(os.environ.get("READS_MAP", "/app/maps/reads.json"))
+CLASSES_MAP = Path(os.environ.get("CLASSES_MAP", "/app/maps/classes.json"))
+STARTUP_CACHE = Path(os.environ.get("STARTUP_CACHE", "/app/startup.pickle"))
 # A reference line executed by this many tests is a shared helper, not a signal
 # that those tests depend on the particular class attribute that changed.
 HOT_REFERENCE = 40
@@ -147,9 +152,13 @@ class Selector:
         for test in catalog:
             self.by_file.setdefault(test["file"], []).append(test["number"])
             self.test_modules.setdefault(module_name(test["file"]), []).append(test["id"])
-        self.fixtures = build_fixture_index(root)
-        self.imports = build_import_graph(root)
-        self.enums = enum_names(root)
+        state = startup_cache.load(STARTUP_CACHE, root)
+        self.fixtures = state["fixtures"]
+        self.imports = state["imports"]
+        self.enums = state["enums"]
+        self.uncovered = UncoveredTests(READS_MAP, self.by_node, root)
+        self.class_users = ClassUsers(CLASSES_MAP, self.by_node, root)
+        self.class_users.test_words = state["test_words"]
         self._mentions: dict[str, list[tuple[str, int]] | None] = {}
         self._key_lines: dict[str, set[int]] = {}
 
@@ -168,6 +177,8 @@ class Selector:
         selected: set[int] = set()
         for file_diff in parse_patch(patch_text):
             selected |= self._file(file_diff)
+            if not file_diff.binary:
+                selected |= self.uncovered.select(file_diff)
         return selected
 
     def _file(self, file_diff: FileDiff) -> set[int]:
@@ -204,7 +215,7 @@ class Selector:
             patched = apply_hunks(original, file_diff.hunks) if file_diff.old_path else _added_text(file_diff)
             new_tree = ast.parse(patched)
         except (DiffApplyError, SyntaxError):
-            return set(self.by_file.get(path, ()))
+            return set(self.by_file.get(path, ())) | self.importers_of(path)
         if not original:
             return set(self.by_file.get(path, ()))
         old_tree = ast.parse(original)
@@ -212,13 +223,23 @@ class Selector:
             return set()
         changed = _changed_test_names(old_tree, new_tree)
         if changed is None:
-            return set(self.by_file.get(path, ()))
+            return set(self.by_file.get(path, ())) | self._helper_dependents(path, old_tree, new_tree)
         selected: set[int] = set()
         for class_name, function_name in changed:
             node_id = f"{path}::{class_name}::{function_name}" if class_name else f"{path}::{function_name}"
             if node_id in self.by_node:
                 selected.add(self.by_node[node_id])
         return selected or set(self.by_file.get(path, ()))
+
+    def _helper_dependents(self, path: str, old_tree: ast.AST, new_tree: ast.AST) -> set[int]:
+        """Tests in other files that import this test module and use what changed."""
+        importers = self.importers_of(path)
+        candidates = {name for name, numbers in self.by_file.items() if importers.intersection(numbers)}
+        names = changed_helper_names(old_tree, new_tree)
+        selected: set[int] = set()
+        for relative in dependent_files(self.root, path, candidates, names):
+            selected.update(self.by_file.get(relative, ()))
+        return selected
 
     def _library_python(self, file_diff: FileDiff, path: str) -> set[int]:
         original_path = self.root / (file_diff.old_path or path)
@@ -246,16 +267,19 @@ class Selector:
         # into the line. Tests that never executed it cannot observe it.
         # Other control-flow edits stay wide.
         narrow = data_only(old_tree, new_tree) or identity_swap(old_tree, new_tree)
+        renamed_keys = changed_dict_keys(old_tree, new_tree) if narrow else None
         selected: set[int] = set()
         removed = [(line, text) for line, text in removed_lines(file_diff.hunks) if python_code(text)]
         added = [(line, text) for line, text in added_lines(file_diff.hunks) if python_code(text)]
         for line, _text in removed:
-            selected |= self._old_line(path, old_tree, line, narrow)
+            selected |= self._old_line(path, old_tree, line, narrow, renamed_keys)
         if added and not removed:
             selected |= self._insertion(path, old_tree, new_tree, [line for line, _text in added])
         return selected
 
-    def _old_line(self, path: str, tree: ast.AST, line: int, narrow: bool) -> set[int]:
+    def _old_line(
+        self, path: str, tree: ast.AST, line: int, narrow: bool, renamed_keys: set[str] | None = None
+    ) -> set[int]:
         functions, classes = functions_and_classes(tree)
         # Calling a lambda executes its body. Tests that only imported the class
         # ran the header and did not see a value change inside the body.
@@ -295,6 +319,9 @@ class Selector:
                     return tail
                 return tests_on_lines(self.coverage, path, _start(function), _end(function))
             return selected
+        scoped = self.class_users.select(path, tree, line, self.coverage, self.mentions, renamed_keys=renamed_keys)
+        if scoped is not None:
+            return scoped
         if narrow:
             keyed = self._dict_key_readers(tree, line)
             if keyed:
@@ -473,7 +500,10 @@ class Selector:
         for line in lines:
             function = tightest(new_functions, line)
             if function is None:
-                selected |= self._scope_name(path, new_tree, line, tightest(new_classes, line), False)
+                scoped = self.class_users.select(path, new_tree, line, self.coverage, self.mentions, original=False)
+                if scoped is None:
+                    scoped = self._scope_name(path, new_tree, line, tightest(new_classes, line), False)
+                selected |= scoped
                 continue
             class_node = tightest(new_classes, line)
             class_name = class_node.name if class_node is not None else None  # type: ignore[attr-defined]
@@ -566,6 +596,9 @@ MAX_COMPANIONS = 8
 
 
 def main() -> None:
+    if sys.argv[1:] == ["--prepare"]:
+        startup_cache.write(STARTUP_CACHE, ROOT)
+        return
     catalog = json.loads((DATA / "tests.json").read_text(encoding="utf-8"))["tests"]
     numbers = {test["id"]: test["number"] for test in catalog}
     seconds = {test["number"]: float(test["seconds"]) for test in catalog}
