@@ -8,6 +8,10 @@ observe it. Any other edit keeps the wider coverage set.
 from __future__ import annotations
 
 import ast
+from collections.abc import Callable
+from pathlib import Path
+
+from analyze import statement_at
 
 
 # Identity and equality agree for the comparisons these swaps replace.
@@ -59,6 +63,96 @@ def _data(old: object, new: object, conditional: bool) -> bool:
         elif left != right:
             return False
     return True
+
+
+def component_sinks(
+    root: Path,
+    name: str,
+    mentions: Callable[[str], list[tuple[str, int]] | None],
+) -> list[tuple[str, int]] | None:
+    """Lines that index a value which flowed out of `name`.
+
+    Membership and truthiness checks do not read a constant stored inside the
+    value. None means the flow was too wide to follow.
+    """
+    found = mentions(name)
+    if not found:
+        return None
+    trees: dict[str, ast.AST | None] = {}
+
+    def parsed(relative: str) -> ast.AST | None:
+        if relative not in trees:
+            try:
+                trees[relative] = ast.parse((root / relative).read_text(encoding="utf-8"))
+            except (SyntaxError, OSError):
+                trees[relative] = None
+        return trees[relative]
+
+    aliases: set[str] = set()
+    for relative, lineno in found:
+        tree = parsed(relative)
+        statement = statement_at(tree, lineno) if tree is not None else None
+        if statement is not None:
+            aliases |= _value_aliases(statement, name)
+    aliases.discard(name)
+    if not aliases:
+        return None
+    sinks: list[tuple[str, int]] = []
+    for alias in aliases:
+        alias_lines = mentions(alias)
+        if not alias_lines:
+            return None
+        for relative, lineno in alias_lines:
+            tree = parsed(relative)
+            if tree is not None and _reads_component(tree, lineno, alias):
+                sinks.append((relative, lineno))
+    return sinks or None
+
+
+def _contains_name(node: ast.AST, name: str) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == name:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr == name:
+            return True
+    return False
+
+
+def _value_aliases(statement: ast.AST, name: str) -> set[str]:
+    aliases: set[str] = set()
+    for node in ast.walk(statement):
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg and _contains_name(keyword.value, name):
+                    aliases.add(keyword.arg)
+        elif isinstance(node, ast.Assign) and _contains_name(node.value, name):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    aliases.add(target.id)
+                elif isinstance(target, ast.Attribute):
+                    aliases.add(target.attr)
+    return aliases
+
+
+def _reads_component(tree: ast.AST, lineno: int, alias: str) -> bool:
+    for node in ast.walk(tree):
+        if getattr(node, "lineno", None) != lineno:
+            continue
+        if isinstance(node, ast.Subscript) and _expr_has_alias(node.value, alias):
+            return True
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr in {"get", "items", "values"} and _expr_has_alias(node.func.value, alias):
+            return True
+    return False
+
+
+def _expr_has_alias(node: ast.AST, alias: str) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id == alias
+    if isinstance(node, ast.Attribute):
+        return node.attr == alias or _expr_has_alias(node.value, alias)
+    return False
 
 
 def _condition_field(node: ast.AST, name: str) -> bool:

@@ -28,7 +28,7 @@ from analyze import (
     tightest,
 )
 from diffutil import DiffApplyError, FileDiff, added_lines, apply_hunks, parse_patch, removed_lines
-from edits import data_only, identity_swap
+from edits import component_sinks, data_only, identity_swap
 from pack import pack
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
@@ -251,11 +251,34 @@ class Selector:
             end = statement.end_lineno if statement is not None and statement.end_lineno else line
             selected = tests_on_lines(self.coverage, path, start, end)
             if not selected:
-                selected = tests_on_lines(self.coverage, path, _start(function), _end(function))
+                return tests_on_lines(self.coverage, path, line, _end(function))
             return selected
-        return self._scope_name(path, tree, line, tightest(classes, line))
+        return self._scope_name(path, tree, line, tightest(classes, line), narrow)
 
-    def _scope_name(self, path: str, tree: ast.AST, line: int, class_node: ast.AST | None) -> set[int]:
+    def _observed_value(self, name: str, class_node: ast.AST | None) -> set[int]:
+        if self.mentions(name) is not None:
+            sinks = component_sinks(self.root, name, self.mentions)
+            readers: set[int] = set()
+            for relative, lineno in sinks or []:
+                readers |= self.coverage.get(relative, {}).get(lineno, set())
+            return readers
+        if class_node is None:
+            return set()
+        class_name = class_node.name  # type: ignore[attr-defined]
+        mentions = self.mentions(class_name)
+        if not mentions:
+            return set()
+        readers = set()
+        for relative, lineno in mentions:
+            owners = self.coverage.get(relative, {}).get(lineno, set())
+            if len(owners) > HOT_REFERENCE:
+                return set()
+            readers |= owners
+        return readers
+
+    def _scope_name(
+        self, path: str, tree: ast.AST, line: int, class_node: ast.AST | None, narrow: bool
+    ) -> set[int]:
         statement = statement_at(tree, line)
         if isinstance(statement, (ast.Import, ast.ImportFrom)):
             return self.importers_of(path) | tests_touching(self.coverage, path)
@@ -273,6 +296,10 @@ class Selector:
                 readers |= owners
             if readers and not shared:
                 return readers
+        if narrow and len(names) == 1:
+            observed = self._observed_value(names[0], class_node)
+            if observed:
+                return observed
         useful = [name for name in names if self.mentions(name) is not None]
         if class_node is not None and not useful:
             class_name = class_node.name  # type: ignore[attr-defined]
@@ -295,7 +322,7 @@ class Selector:
         for line in lines:
             function = tightest(new_functions, line)
             if function is None:
-                selected |= self._scope_name(path, new_tree, line, tightest(new_classes, line))
+                selected |= self._scope_name(path, new_tree, line, tightest(new_classes, line), False)
                 continue
             class_node = tightest(new_classes, line)
             class_name = class_node.name if class_node is not None else None  # type: ignore[attr-defined]
