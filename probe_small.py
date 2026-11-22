@@ -16,6 +16,8 @@ import unittest
 from collections.abc import Callable
 from pathlib import Path
 
+from warm_probe import WARM
+
 MAX_SECONDS = 0.5
 MAX_COUNT = 8
 ALARM_S = 3.0
@@ -55,6 +57,16 @@ def _overlay(base: Path, dest: Path, patched: dict[str, str]) -> None:
             here.symlink_to(entry, target_is_directory=entry.is_dir())
 
 
+def _modifies_only(patch_text: str) -> bool:
+    """Every file of the patch is an existing text file edited in place."""
+    from diffutil import parse_patch
+
+    return all(
+        not file_diff.binary and file_diff.old_path is not None and file_diff.old_path == file_diff.new_path
+        for file_diff in parse_patch(patch_text)
+    )
+
+
 def _apply(root: Path, patch_text: str) -> dict[str, str]:
     from diffutil import apply_hunks, parse_patch
 
@@ -69,8 +81,13 @@ def _apply(root: Path, patch_text: str) -> dict[str, str]:
 
 
 def _install_inline_pool() -> None:
-    """Run pool work in this process so a patched module stays visible."""
+    """Run pool work in this process so a patched module stays visible.
+
+    Calls and results still go through pickle, as with a process pool, since
+    pickling runs sqlglot code too (expressions pickle through serde).
+    """
     import concurrent.futures
+    import pickle
 
     class InlineExecutor:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -79,7 +96,8 @@ def _install_inline_pool() -> None:
         def submit(self, fn, /, *args, **kwargs):  # type: ignore[no-untyped-def]
             future = concurrent.futures.Future()
             try:
-                future.set_result(fn(*args, **kwargs))
+                call, call_args, call_kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                future.set_result(pickle.loads(pickle.dumps(call(*call_args, **call_kwargs))))
             except BaseException as exc:
                 future.set_exception(exc)
             return future
@@ -134,6 +152,7 @@ def run_patched(root: Path, patch_text: str, job: Callable[[], object], limit_s:
     import json
 
     patched = _apply(root, patch_text)
+    swaps = WARM.swaps(root, patched) if _modifies_only(patch_text) else None
     with tempfile.TemporaryDirectory(prefix="probe-") as folder:
         tree = Path(folder) / "tree"
         tree.mkdir()
@@ -149,6 +168,7 @@ def run_patched(root: Path, patch_text: str, job: Callable[[], object], limit_s:
                 os.chdir(tree)
                 sys.path.insert(0, str(tree))
                 os.environ["SKIP_INTEGRATION"] = "0"
+                WARM.enter(root, tree, swaps)
                 result_path.write_text(json.dumps(job()))
                 os._exit(0)
             except BaseException:

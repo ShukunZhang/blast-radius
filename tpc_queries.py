@@ -47,13 +47,13 @@ class _Recorder:
     @contextlib.contextmanager
     def into(self, sink: Lines) -> Iterator[None]:
         previous = self.sink
-        self._switch(sink)
+        self.switch(sink)
         try:
             yield
         finally:
-            self._switch(previous)
+            self.switch(previous)
 
-    def _switch(self, sink: Lines | None) -> None:
+    def switch(self, sink: Lines | None) -> None:
         self.sink = sink
         sys.monitoring.restart_events()
 

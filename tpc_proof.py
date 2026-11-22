@@ -38,8 +38,8 @@ PROBE_BASE_S = 0.25
 TABLES_S = 0.35
 ALL_TABLES_S = 1.0
 PARSE_S = 0.01
-# A probe that executes queries finds a break about half the time, after spending part of its estimate.
-EXECUTE_RISK = 0.3
+# A probe that executes queries sometimes finds a break, usually within its first queries.
+EXECUTE_RISK = 0.15
 PROBE_LIMIT_S = 60.0
 _GUARDED_TESTS = {"tests/test_executor.py", "tests/helpers.py", "tests/__init__.py", "tests/conftest.py"}
 _INERT_SUFFIXES = (".md", ".rst", ".txt")

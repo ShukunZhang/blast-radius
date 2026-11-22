@@ -25,6 +25,7 @@ import json
 import os
 import pkgutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 
@@ -33,6 +34,52 @@ def _key(cls: type) -> str | None:
     if not module.startswith("sqlglot"):
         return None
     return f"{module}:{cls.__qualname__}"
+
+
+def used_classes(obj: object) -> list[type]:
+    """The MRO of a component object, and of its dialect and the dialect's component classes."""
+    from sqlglot.dialects.dialect import Dialect
+
+    classes = list(type(obj).__mro__)
+    dialect = obj if isinstance(obj, Dialect) else getattr(obj, "dialect", None)
+    if isinstance(dialect, Dialect):
+        for attribute in ("tokenizer_class", "parser_class", "generator_class"):
+            component = getattr(type(dialect), attribute, None)
+            if isinstance(component, type):
+                classes.extend(component.__mro__)
+        classes.extend(type(dialect).__mro__)
+    return classes
+
+
+def hook_entry_points(note: Callable[[object], None]) -> None:
+    """Call `note` with the object of every constructor and entry point of the dialect components."""
+    from sqlglot.dialects.dialect import Dialect
+    from sqlglot.generator import Generator
+    from sqlglot.optimizer.annotate_types import TypeAnnotator
+    from sqlglot.parser import Parser
+    from sqlglot.tokens import Tokenizer
+
+    def wrap(owner: type, name: str) -> None:
+        original = owner.__dict__.get(name)
+        if original is None:
+            return
+
+        @functools.wraps(original)
+        def hooked(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            note(self)
+            return original(self, *args, **kwargs)
+
+        setattr(owner, name, hooked)
+
+    for owner, names in (
+        (Parser, ("__init__", "parse", "parse_into")),
+        (Generator, ("__init__", "generate")),
+        (Tokenizer, ("__init__", "tokenize")),
+        (Dialect, ("__init__", "parse", "parse_into", "generate", "tokenize", "parser", "generator")),
+        (TypeAnnotator, ("__init__",)),
+    ):
+        for name in names:
+            wrap(owner, name)
 
 
 def _import_everything() -> None:
@@ -62,7 +109,6 @@ def main() -> None:
 
     from sqlglot.dialects.dialect import Dialect
     from sqlglot.generator import Generator
-    from sqlglot.optimizer.annotate_types import TypeAnnotator
     from sqlglot.parser import Parser
     from sqlglot.tokens import Tokenizer
 
@@ -100,41 +146,13 @@ def main() -> None:
             types[key] = cls
 
     def note(obj: object) -> None:
-        classes = list(type(obj).__mro__)
-        dialect = obj if isinstance(obj, Dialect) else getattr(obj, "dialect", None)
-        if isinstance(dialect, Dialect):
-            for attribute in ("tokenizer_class", "parser_class", "generator_class"):
-                component = getattr(type(dialect), attribute, None)
-                if isinstance(component, type):
-                    classes.extend(component.__mro__)
-            classes.extend(type(dialect).__mro__)
-        for cls in classes:
+        for cls in used_classes(obj):
             key = _key(cls)
             if key is not None:
                 current.add(key)
                 types[key] = cls
 
-    def wrap(owner: type, name: str) -> None:
-        original = owner.__dict__.get(name)
-        if original is None:
-            return
-
-        @functools.wraps(original)
-        def hooked(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-            note(self)
-            return original(self, *args, **kwargs)
-
-        setattr(owner, name, hooked)
-
-    for owner, names in (
-        (Parser, ("__init__", "parse", "parse_into")),
-        (Generator, ("__init__", "generate")),
-        (Tokenizer, ("__init__", "tokenize")),
-        (Dialect, ("__init__", "parse", "parse_into", "generate", "tokenize", "parser", "generator")),
-        (TypeAnnotator, ("__init__",)),
-    ):
-        for name in names:
-            wrap(owner, name)
+    hook_entry_points(note)
 
     import pytest
 

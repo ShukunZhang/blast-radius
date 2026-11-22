@@ -7,7 +7,9 @@ the tests that used the edited class or a subclass bound what can fail. When
 every read of the attribute is a line inside an ordinary method, the tests
 that executed one of those lines narrow it further. An entry of a generator's
 `TRANSFORMS` is read through the cached dispatch table, so the recorded
-dispatch lookups of its expression class stand in for that read.
+dispatch lookups of its expression class stand in for that read. A table a
+metaclass derives from the attribute onto the class it creates (a trie from a
+mapping) is read wherever the derived attribute is.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from class_reads import (
     chain_tail,
     constant_truth,
     copied_owners,
+    derived_attribute,
     dict_entry_key,
     dynamic_access,
     ever_executed,
@@ -39,6 +42,8 @@ Coverage = dict[str, dict[int, set[int]]]
 Mentions = Callable[[str], "list[tuple[str, int]] | None"]
 # `collect_classes.py` records the lookups into the table this function builds.
 _DISPATCH_SITE = ("sqlglot/generator.py", "_build_dispatch")
+# Tables derived from tables while classes are created, followed before giving up.
+_MAX_DERIVATIONS = 8
 
 
 class ClassUsers:
@@ -122,12 +127,12 @@ class ClassUsers:
         proof = self._readers(names[0], key, coverage, mentions, truthy, bool(entries), values_only)
         if proof is None:
             return observers
-        readers, copiers, via_dispatch = proof
+        readers, copiers, via_dispatch, derived = proof
         for copier in copiers:
             if copier not in self.users:
                 return observers | self._all_users()
             observers |= self.users[copier]
-        if entries:
+        if entries and not derived:
             sources = {key} | copiers
             if via_dispatch:
                 readers |= self._dispatched(sources, entries)
@@ -190,15 +195,19 @@ class ClassUsers:
         truthy: bool | None,
         entry: bool,
         values_only: bool,
-    ) -> tuple[set[int], set[str], bool] | None:
+        derivations: tuple[tuple[str, int, int], ...] = (),
+    ) -> tuple[set[int], set[str], bool, bool] | None:
         """Tests executing a method line that loads `name`, classes whose body copies the edited
-        class's value, and whether the generator's dispatch table is one of the reads.
+        class's value, whether the generator's dispatch table is one of the reads, and whether a
+        table derived from `name` while classes are created was followed.
 
         None when a read cannot be traced to such a line. With the truth of the
         value the tests read, a read that only lets a short-circuit chain go on
         counts the tests that reached the chain's last operand. When the edit
         changed only dict values, reads at class creation that use only the keys
-        cannot see it.
+        cannot see it. A read at class creation that sets `klass.X` on the class
+        created stands for the readers of `X`; `derivations` holds the statements
+        so far, whose own reads see the value before it is set.
         """
         found = mentions(name)
         if found is None:
@@ -206,7 +215,10 @@ class ClassUsers:
         readers: set[int] = set()
         class_sites: list[tuple[str, ast.AST, int]] = []
         via_dispatch = False
+        derived: dict[str, list[tuple[str, int, int]]] = {}
         for relative, lineno in found:
+            if any(relative == path and start <= lineno <= end for path, start, end in derivations):
+                continue
             tree = self._tree(relative)
             if tree is None:
                 return None
@@ -225,17 +237,23 @@ class ClassUsers:
             if function is None:
                 class_sites.append((relative, tree, lineno))
                 continue
-            if at_class_creation(tree, function) and not in_place(statement_on(tree, lineno), name):
+            statement = statement_on(tree, lineno)
+            if at_class_creation(tree, function) and not in_place(statement, name):
                 if values_only and keys_only(tree, lineno, name):
                     continue
-                return None
+                target = derived_attribute(function, statement, name)
+                if target is None or statement is None:
+                    return None
+                span = (relative, statement.lineno, statement.end_lineno or statement.lineno)  # type: ignore[attr-defined]
+                derived.setdefault(target, []).append(span)
+                continue
             if memoized(tree, function):
                 if entry and (relative, function.name) == _DISPATCH_SITE:  # type: ignore[attr-defined]
                     via_dispatch = True
                     continue
                 return None
             owners = coverage.get(relative, {}).get(lineno, set())
-            if not owners and not ever_executed(coverage, relative, function):
+            if not owners and not getattr(coverage, "complete", False) and not ever_executed(coverage, relative, function):
                 return None
             if truthy is not None:
                 last = chain_tail(tree, lineno, name, truthy)
@@ -245,7 +263,16 @@ class ClassUsers:
         copiers = self._copiers(name, key, class_sites, values_only)
         if copiers is None:
             return None
-        return readers, copiers, via_dispatch
+        for target, spans in derived.items():
+            if len(derivations) + len(spans) > _MAX_DERIVATIONS:
+                return None
+            proof = self._readers(target, key, coverage, mentions, None, False, False, (*derivations, *spans))
+            if proof is None:
+                return None
+            readers |= proof[0]
+            copiers |= proof[1]
+            via_dispatch |= proof[2]
+        return readers, copiers, via_dispatch, bool(derived)
 
     def _tree(self, relative: str) -> ast.AST | None:
         if relative not in self._trees:

@@ -73,6 +73,42 @@ def at_class_creation(tree: ast.AST, function: ast.AST) -> bool:
     return any(isinstance(base, ast.Name) and base.id == "type" for base in owner.bases)  # type: ignore[attr-defined]
 
 
+def derived_attribute(function: ast.AST, statement: ast.AST | None, name: str) -> str | None:
+    """`X` when `statement` is `klass.X = ...` computed from `.NAME`, `klass` being the class created: bound by
+    `klass = super().__new__(...)` in a metaclass `__new__`, or the class `__init_subclass__` gets."""
+    if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1):
+        return None
+    target = statement.targets[0]
+    if not (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)):
+        return None
+    if not any(isinstance(node, ast.Attribute) and node.attr == name for node in ast.walk(statement.value)):
+        return None
+    return target.attr if target.value.id in _created_names(function) else None
+
+
+def _created_names(function: ast.AST) -> set[str]:
+    arguments = getattr(function, "args", None)
+    if function.name == "__init_subclass__" and arguments is not None and arguments.args:  # type: ignore[attr-defined]
+        return {arguments.args[0].arg}
+    if function.name != "__new__":  # type: ignore[attr-defined]
+        return set()
+    return {
+        node.targets[0].id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and _is_super_new(node.value)
+    }
+
+
+def _is_super_new(value: ast.AST) -> bool:
+    if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) and value.func.attr == "__new__"):
+        return False
+    inner = value.func.value
+    return isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "super"
+
+
 def dynamic_access(tree: ast.AST, lineno: int, name: str) -> bool:
     """`getattr(obj, "NAME")` and friends, which read the attribute without naming it in code."""
     for node in nodes_at(tree, lineno):

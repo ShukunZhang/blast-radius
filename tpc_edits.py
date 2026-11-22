@@ -27,6 +27,8 @@ class Reach:
     spans: list[tuple[int, int]] = field(default_factory=list)
     level: str | None = None
     needs_probe: bool = False
+    # The edited lines judged by name, each with the tree it is in: "old" (pinned) or "new" (patched).
+    outside: list[tuple[str, int]] = field(default_factory=list)
 
     def escalate(self, harmless: bool) -> None:
         self.level = FULL if not harmless or self.level == FULL else PLAN_ALL
@@ -41,13 +43,14 @@ def file_reach(old_tree: ast.Module, new_tree: ast.Module, hunks: list[Hunk], na
             inside = _in_body(_chain(old_tree, line), line, old_functions)
             if inside is not None:
                 reach.spans.append(_span(_widened(_chain(old_tree, line), inside[1])))
-            else:
-                _outside_body(reach, _chain(old_tree, line), line, old_functions, names)
+            elif _outside_body(reach, _chain(old_tree, line), line, old_functions, names):
+                reach.outside.append(("old", line))
         for line in added:
             chain = _chain(new_tree, line)
             inside = _in_body(chain, line, old_functions)
             if inside is None:
-                _outside_body(reach, chain, line, old_functions, names)
+                if _outside_body(reach, chain, line, old_functions, names):
+                    reach.outside.append(("new", line))
             elif anchor is not None and anchor[2] == inside[0] and chain[-1].col_offset >= anchor[1]:
                 reach.spans.append(anchor[0])
             else:
@@ -194,8 +197,8 @@ def _anchor(old_tree: ast.Module, lines: list[int], insertion: bool) -> tuple[tu
     return (_span(statement), getattr(statement, "col_offset", function.body[0].col_offset), name)
 
 
-def _outside_body(reach: Reach, chain: list[ast.stmt], line: int, old_functions: dict[str, list[Function]], names: set[str]) -> None:
-    """Judge an edit outside pinned function bodies by the names its statement binds."""
+def _outside_body(reach: Reach, chain: list[ast.stmt], line: int, old_functions: dict[str, list[Function]], names: set[str]) -> bool:
+    """Judge an edit outside pinned function bodies by the names its statement binds; True when it escalated."""
     reach.needs_probe = True
     function_indexes = [index for index, node in enumerate(chain) if isinstance(node, _FUNCTIONS)]
     existing = [index for index in function_indexes if _qualname(chain[: index + 1]) in old_functions]
@@ -206,15 +209,16 @@ def _outside_body(reach: Reach, chain: list[ast.stmt], line: int, old_functions:
         statement = chain[function_indexes[-1]]
         if line >= statement.lineno and not any(decorator.lineno <= line <= (decorator.end_lineno or 0) for decorator in statement.decorator_list):
             reach.spans.extend(_span(function) for function in old_functions[_qualname(chain[: function_indexes[-1] + 1])])
-            return
+            return False
     elif chain:
         statement = chain[-1]
     else:
-        return
+        return False
     if _no_code(statement) and not isinstance(statement, ast.AnnAssign):
-        return
+        return False
     bound = _bound(statement)
     reach.escalate(bool(bound) and not any(name in names or name.startswith("__") for name in bound))
+    return True
 
 
 def _bound(node: ast.stmt) -> set[str]:

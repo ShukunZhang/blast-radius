@@ -41,6 +41,7 @@ from helper_edits import changed_helper_names, dependent_files
 from pack import pack
 import startup_cache
 from probe_small import confirm, should_probe
+from case_proof import CASES_MAP, CaseProof
 from tpc_proof import TpcProof, prepare_tables
 from uncovered import UncoveredTests
 
@@ -623,11 +624,13 @@ def main() -> None:
     }
     by_number = {test["number"]: test for test in catalog}
     tpc = TpcProof(TPC_MAP, ROOT)
+    cases = CaseProof(CASES_MAP, ROOT, selector.class_users, selector.mentions)
     commits = sorted((DATA / "commits").glob("*.patch"))
     for patch in commits:
         text = patch.read_text(encoding="utf-8")
         selected = selector.choose(text)
         selected = tpc.drop_passing(text, selected, by_number, lambda chosen: schedule_cost(chosen, seconds))
+        selected = cases.drop_passing(text, selected, by_number, lambda chosen: schedule_cost(chosen, seconds))
         selected = drop_slow_if_companions_pass(text, catalog, selected, seconds, heavy)
         if should_probe(selected, seconds, text, heavy):
             selected = confirm(ROOT, text, catalog, selected)

@@ -211,6 +211,7 @@ def record(suite: str) -> list[dict[str, Any] | None]:
 
     schema, pairs = _parts(suite)
     tables = _Tables(None, suite, schema)
+    tables.ship_all()
     entries: list[dict[str, Any] | None] = []
     for meta, sql in pairs:
         received = _received(sql)
