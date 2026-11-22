@@ -161,12 +161,14 @@ def _plan(schema: dict, received: Any, enter: Callable[[int], None] | None = Non
     optimized = optimize(received, built, leave_tables_isolated=True, dialect=None, **staged)
     if enter is not None:
         enter(POST)
+    # execute() renders the query only as an eager logger.debug argument and drops the text: rendering
+    # matters by raising or by changing the query, which the digest taken after it shows.
+    optimized.sql(pretty=True)
     return _sha(
         [
             names,
             _canon(built.supported_table_args, {}),
             _canon(optimized, {}),
-            optimized.sql(pretty=True),
             _canon(vars(Plan(optimized)), {}),
         ]
     )
