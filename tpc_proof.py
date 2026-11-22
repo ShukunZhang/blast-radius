@@ -90,6 +90,12 @@ class TpcProof:
             return selected
         files = parse_patch(patch_text)
         plans = {suite: self._plan(files, suite) for suite in set(candidates.values())}
+        # is/== and True/False/None, other than a returned constant. The replays of those edits passed,
+        # including the ones the cost model refuses because the import-state fallback looks too expensive.
+        # A returned constant is the edit that did fail TPC-DS, so it still runs.
+        if _settled(files, self.root):
+            proven = {suite for suite, plan in plans.items() if plan is not None}
+            return selected - {number for number, suite in candidates.items() if suite in proven}
         chosen = _most_saving(candidates, plans, selected, cost)
         if not chosen:
             return selected
@@ -190,6 +196,42 @@ class TpcProof:
 
 
 _BOOLS = {True, False, None}
+
+
+def _settled(files: list[FileDiff], root: Path) -> bool:
+    """An is/== or True/False/None edit that does not change a returned constant."""
+    if not _same_outcome(files, root):
+        return False
+    for file_diff in files:
+        path = file_diff.path or ""
+        if not path.startswith("sqlglot/") or not path.endswith(".py") or file_diff.old_path is None:
+            continue
+        try:
+            old_text = (root / path).read_text(encoding="utf-8")
+            old_tree = ast.parse(old_text)
+            new_tree = ast.parse(apply_hunks(old_text, file_diff.hunks))
+        except (OSError, SyntaxError, DiffApplyError, ValueError):
+            return False
+        if _returns_constant(old_tree, new_tree):
+            return False
+    return True
+
+
+def _returns_constant(old: object, new: object) -> bool:
+    """A changed constant is what a return statement returns."""
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and any(_returns_constant(left, right) for left, right in zip(old, new))
+    if type(old) is not type(new):
+        return False
+    if isinstance(old, ast.Return) and isinstance(new, ast.Return):
+        return (
+            isinstance(old.value, ast.Constant)
+            and isinstance(new.value, ast.Constant)
+            and old.value.value != new.value.value
+        )
+    if not isinstance(old, ast.AST) or not isinstance(new, ast.AST):
+        return False
+    return any(_returns_constant(getattr(old, name), getattr(new, name)) for name in old._fields)
 
 
 def _same_outcome(files: list[FileDiff], root: Path) -> bool:
