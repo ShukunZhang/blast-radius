@@ -44,6 +44,7 @@ from probe_small import confirm, should_probe
 from case_proof import CASES_MAP, CaseProof
 from tpc_proof import TpcProof, prepare_tables
 from uncovered import UncoveredTests
+from value_edits import ValueProfile
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 ROOT = Path(os.environ.get("SQLGLOT_ROOT", "/opt/sqlglot"))
@@ -162,6 +163,7 @@ class Selector:
         self.uncovered = UncoveredTests(READS_MAP, self.by_node, root)
         self.class_users = ClassUsers(CLASSES_MAP, self.by_node, root)
         self.class_users.test_words = state["test_words"]
+        self.values = ValueProfile()
         self._mentions: dict[str, list[tuple[str, int]] | None] = {}
         self._key_lines: dict[str, set[int]] = {}
 
@@ -265,6 +267,8 @@ class Selector:
         # `is`/`==` is not in that set: equal objects that are not the same
         # object can fail a test, so those lines keep the tests that ran them.
         if boundary_unreachable(old_tree, new_tree) or neutral_identity(old_tree, new_tree, self.enums):
+            return set()
+        if self.values.neutral(path, old_tree, new_tree):
             return set()
         # A value change, or an identity comparison, does not send new tests
         # into the line. Tests that never executed it cannot observe it.
