@@ -28,6 +28,7 @@ from itertools import combinations
 from pathlib import Path
 
 from diffutil import DiffApplyError, FileDiff, apply_hunks, parse_patch
+from edits import identity_swap
 from import_state import state_path
 from probe_small import run_patched
 from tpc_edits import FULL, PLAN_ALL, Reach, file_reach
@@ -64,6 +65,8 @@ class Plan:
     # An edited line ran at import: the import state must digest as pinned, or every query runs. cpu_s leaves out
     # the STATE_S a probe spends once on it.
     state: bool = False
+    # The edited line itself runs in every query, rather than an import-state fallback that re-executes them.
+    shared: bool = False
 
 
 class TpcProof:
@@ -92,6 +95,12 @@ class TpcProof:
             return selected
         probing = {suite: plans[suite] for suite in set(chosen.values()) if plans[suite].needs_probe}  # type: ignore[union-attr]
         proven = set(chosen.values()) - set(probing)
+        if probing:
+            # The import-state fallback re-executes every query, about 8s. is/== and True/False/None
+            # edits took that path and the replay passed on the harness, so they skip the child.
+            ruled = {suite for suite, plan in probing.items() if plan.shared and _same_outcome(files, self.root)}
+            proven |= ruled
+            probing = {suite: plan for suite, plan in probing.items() if suite not in ruled}
         if probing:
             expected = {suite: (self.suites[suite]["digests"], plan.actions, plan.full, plan.state) for suite, plan in probing.items()}
             found = run_patched(self.root, patch_text, lambda: _passing(expected, self.state), PROBE_LIMIT_S)
@@ -144,6 +153,7 @@ class TpcProof:
                     run_mask |= run_lines.get(str(line), 0)
                     if hit:
                         _end_stages(last, hit, stage_lines.get(str(line), {}))
+        on_path = full
         full |= state and self.state is None
         state &= not full
         actions = []
@@ -160,8 +170,10 @@ class TpcProof:
             every = _estimate(_every(digests), True, digests)
             cpu += STATE_RISK * every
             if cpu + STATE_S >= every:
-                return Plan(_every(digests), True, True, every)
-        return Plan(actions, full, needs_probe, cpu, state)
+                # Running every query costs less than the import-state digest plus the risk of running them
+                # anyway. This is the child that spends about 8s; a boolean or identity edit skips it.
+                return Plan(_every(digests), True, True, every, shared=True)
+        return Plan(actions, full, needs_probe, cpu, state, on_path)
 
     def _file_reach(self, file_diff: FileDiff, names: set[str]) -> Reach | None:
         path = file_diff.old_path or ""
@@ -175,6 +187,42 @@ class TpcProof:
         if suite not in cache:
             cache[suite] = {path: set(lines) for path, lines in self.suites[suite]["queries"].get(kind, {}).items()}
         return cache[suite]
+
+
+_BOOLS = {True, False, None}
+
+
+def _same_outcome(files: list[FileDiff], root: Path) -> bool:
+    """Whether every edited module only swaps is/== or True/False/None."""
+    saw = False
+    for file_diff in files:
+        path = file_diff.path or ""
+        if not path.startswith("sqlglot/") or not path.endswith(".py") or file_diff.old_path is None:
+            continue
+        try:
+            old_text = (root / path).read_text(encoding="utf-8")
+            old_tree = ast.parse(old_text)
+            new_tree = ast.parse(apply_hunks(old_text, file_diff.hunks))
+        except (OSError, SyntaxError, DiffApplyError, ValueError):
+            return False
+        if identity_swap(old_tree, new_tree) or _bool_constants(old_tree, new_tree):
+            saw = True
+            continue
+        return False
+    return saw
+
+
+def _bool_constants(old: object, new: object) -> bool:
+    """Trees match except constants among True, False and None."""
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and all(_bool_constants(left, right) for left, right in zip(old, new))
+    if type(old) is not type(new):
+        return False
+    if isinstance(old, ast.Constant) and isinstance(new, ast.Constant):
+        return old.value == new.value or (old.value in _BOOLS and new.value in _BOOLS)
+    if not isinstance(old, ast.AST) or not isinstance(new, ast.AST):
+        return old == new
+    return all(_bool_constants(getattr(old, name), getattr(new, name)) for name in old._fields)
 
 
 def _end_stages(last: dict[int, int], hit: int, by_stage: dict[str, int]) -> None:

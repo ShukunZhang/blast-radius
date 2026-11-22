@@ -600,17 +600,6 @@ def drop_slow_if_companions_pass(
 
 
 MAX_COMPANIONS = 8
-# The 29s parser stress test. Its message assertions are the f-string in sqlglot/parser.py;
-# an edit there keeps the test. Elsewhere it passed on every sample and harness commit, and
-# the selection always had another test on the same error path.
-_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
-
-
-def drop_max_nodes(patch_text: str, selected: set[int], tests: dict[int, dict]) -> set[int]:
-    """Drop test_max_nodes when this patch does not edit the limit message and another test remains."""
-    if len(selected) < 2 or "sqlglot/parser.py" in patch_text or "tests/test_parser.py" in patch_text:
-        return selected
-    return {number for number in selected if tests[number]["id"] != _MAX_NODES}
 
 
 def schedule_cost(numbers: set[int], seconds: dict[int, float]) -> float:
@@ -649,7 +638,6 @@ def main() -> None:
         selected = drop_slow_if_companions_pass(text, catalog, selected, seconds, heavy)
         if should_probe(selected, seconds, text, heavy):
             selected = confirm(ROOT, text, catalog, selected)
-        selected = drop_max_nodes(text, selected, by_number)
         print(json.dumps({"commit": patch.stem, "workers": pack(selected, seconds)}, separators=(",", ":")))
         print(f"{patch.stem}: {len(selected)} tests", file=sys.stderr)
 
