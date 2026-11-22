@@ -8,7 +8,9 @@ tpc_fingerprint digests (parsing, pickling the parsed query, transpiling,
 finding tables, building the schema, optimizing, rendering the optimized SQL
 and planning). Python code generation depends on rows reaching subqueries, so
 it is recorded rather than digested. An edit that reaches none of the
-recorded lines changes the test only through those digests.
+recorded lines changes the test only through those digests. Beside the map
+it writes the digest of the state sqlglot builds at import (import_state),
+taken under several hash seeds.
 """
 
 from __future__ import annotations
@@ -20,13 +22,15 @@ import types
 import json
 import os
 import pickle
-import pkgutil
 import subprocess
 import sys
 import unittest
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from pathlib import Path
+
+import import_state
+from import_state import import_everything
 
 HERE = Path(__file__).resolve().parent
 TESTS = {"tpch": "test_execute_tpch", "tpcds": "test_execute_tpcds"}
@@ -94,13 +98,8 @@ def _quiet_log_sql(caller: object) -> None:
     owner.sql = sql
 
 
-def _import_everything(root: Path) -> None:
-    import sqlglot
-
-    for module in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
-        if not module.name.endswith("__main__"):
-            with contextlib.suppress(Exception):
-                __import__(module.name)
+def _import_everything(_root: Path) -> None:
+    import_everything()
 
 
 def _run_one(root: Path, suite: str) -> dict[str, dict[str, list[int]]]:
@@ -312,10 +311,27 @@ def _child_main(kind: str, root: Path, suite: str) -> object:
         import tpc_queries
 
         return tpc_queries.record_lines(root, suite)
+    if kind == "state":
+        sys.path.insert(0, str(root))
+        os.chdir(root)
+        os.environ["SKIP_INTEGRATION"] = "0"
+        return import_state.record()
     return _record(root, suite)
 
 
 SEEDS = ("1", "2", "3")
+# A probe's parent: the selector's modules loaded, then the warm import, then everything else.
+_SELECTOR_STATE = (
+    "import json, os, sys; root = sys.argv[1]; sys.path[:0] = [root, {here!r}]; os.chdir(root); "
+    "os.environ['SKIP_INTEGRATION'] = '0'; import selector, import_state; from warm_probe import WARM_MODULES; "
+    "print(json.dumps(import_state.record(WARM_MODULES)))"
+)
+
+
+def _selector_state(root: Path, seed: str) -> object:
+    command = [sys.executable, "-B", "-c", _SELECTOR_STATE.format(here=str(HERE)), str(root)]
+    environment = {**os.environ, "PYTHONHASHSEED": seed}
+    return json.loads(subprocess.run(command, check=True, capture_output=True, text=True, env=environment).stdout)
 
 
 def main() -> None:
@@ -333,7 +349,8 @@ def main() -> None:
             path: sorted(set(ran["after"].get(path, [])) | set(ran["imported"].get(path, [])))
             for path in sorted(set(ran["after"]) | set(ran["imported"]))
         }
-        queries = tpc_queries.merge([_child("lines", root, suite, seed) for seed in SEEDS] + [{"plan": {}, "run": {}, "shared": ran["imported"]}])
+        queries = tpc_queries.merge([_child("lines", root, suite, seed) for seed in SEEDS])
+        queries["imported"] = ran["imported"]
         built[suite] = {
             "digests": digests,
             "runtime": runtime,
@@ -342,7 +359,11 @@ def main() -> None:
         }
         unknown = sum(1 for entry in digests if entry is not None and entry["result"] is None)
         print(suite, len(digests), "unstable results", unknown, sum(map(len, runtime.values())), file=sys.stderr)
+    runs = [_child("state", root, "", seed) for seed in SEEDS] + [_selector_state(root, seed) for seed in SEEDS[:2]]
+    state = import_state.stable(runs)  # type: ignore[arg-type]
+    print("import state: unordered", len(state["unordered"]), "skipped", state["skip"], file=sys.stderr)  # type: ignore[arg-type]
     out.write_text(json.dumps(built, separators=(",", ":")), encoding="utf-8")
+    import_state.state_path(out).write_text(json.dumps(state, indent=1), encoding="utf-8")
 
 
 if __name__ == "__main__":

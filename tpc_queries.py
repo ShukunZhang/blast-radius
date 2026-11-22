@@ -8,7 +8,8 @@ tables, or run for the first query only and then serve later ones from a
 cache, are "shared": an edit there reaches every query. For plan lines it
 also records the last stage of tpc_fingerprint._plan running them ("stage"),
 so a query whose edited lines all end by optimizer rule k is checked after
-its first k rules.
+its first k rules. It also records the names and strings in the code the
+executor compiles for each query ("env"): the only keys of ENV it can read.
 """
 
 from __future__ import annotations
@@ -89,6 +90,30 @@ def _hook_plan_steps(recorder: _Recorder, current: dict[str, Lines]) -> None:
     owner.sql = sql
 
 
+def _hook_generate(generated: list[set[str]]) -> None:
+    """Record the names and strings of the code the executor compiles, which it evaluates against ENV."""
+    from sqlglot.executor.python import PythonExecutor
+
+    original = PythonExecutor.generate
+
+    def generate(self: object, expression: object) -> object:
+        code = original(self, expression)
+        generated[0] |= _code_names(code)
+        return code
+
+    PythonExecutor.generate = generate  # type: ignore[method-assign]
+
+
+def _code_names(value: object) -> set[str]:
+    if isinstance(value, str):
+        return {value}
+    if isinstance(value, types.CodeType):
+        return set(value.co_names).union(*map(_code_names, value.co_consts))
+    if isinstance(value, (tuple, frozenset)):
+        return set().union(*map(_code_names, value))
+    return set()
+
+
 def record_lines(root: Path, suite: str) -> dict[str, dict]:
     """Plan and run lines per query as bitmasks over query indexes, and the shared lines."""
     sys.path.insert(0, str(root))
@@ -104,6 +129,8 @@ def record_lines(root: Path, suite: str) -> dict[str, dict]:
     recorder = _Recorder(root)
     current: dict[str, Lines] = {}
     _hook_plan_steps(recorder, current)
+    generated: list[set[str]] = [set()]
+    _hook_generate(generated)
     schema, pairs = fp._parts(suite)
     shared: Lines = set()
     with recorder.into(shared):
@@ -113,6 +140,7 @@ def record_lines(root: Path, suite: str) -> dict[str, dict]:
     def run(index: int, plan: Lines, ran: Lines, stages: list[Lines] | None = None) -> None:
         meta, sql = pairs[index]
         current.update(plan=plan, run=ran)
+        generated[0] = set()
         with recorder.into(plan):
             received = fp._received(sql)
             if meta.get("execute"):
@@ -134,11 +162,14 @@ def record_lines(root: Path, suite: str) -> dict[str, dict]:
     plans: list[Lines] = []
     runs: list[Lines] = []
     staged: list[list[Lines]] = []
+    names: dict[str, int] = {}
     for index in range(len(pairs)):
         plans.append(set())
         runs.append(set())
         staged.append([set() for _ in range(fp.POST + 1)])
         run(index, plans[-1], runs[-1], staged[-1])
+        for name in generated[0]:
+            names[name] = names.get(name, 0) | (1 << index)
     sys.monitoring.set_events(sys.monitoring.COVERAGE_ID, 0)
     every = set().union(*plans, *runs)
     return {
@@ -146,6 +177,7 @@ def record_lines(root: Path, suite: str) -> dict[str, dict]:
         "run": _masks(runs),
         "shared": _by_path(shared | (warm - every)),
         "stage": _stage_masks(_last_stages(staged, fp.POST)),
+        "env": names,
     }
 
 
@@ -205,10 +237,12 @@ def _by_path(lines: Lines) -> dict[str, list[int]]:
 
 def merge(runs: list[dict[str, dict]]) -> dict[str, dict]:
     """The union of recordings made under different hash seeds, whose set orders take different paths."""
-    merged: dict[str, dict] = {"plan": {}, "run": {}, "shared": {}}
+    merged: dict[str, dict] = {"plan": {}, "run": {}, "shared": {}, "env": {}}
     last: LastStages = {}
     for found in runs:
         _unmask(found.get("stage", {}), last)
+        for name, mask in found.get("env", {}).items():
+            merged["env"][name] = merged["env"].get(name, 0) | mask
         for kind in ("plan", "run"):
             for path, by_line in found[kind].items():
                 into = merged[kind].setdefault(path, {})

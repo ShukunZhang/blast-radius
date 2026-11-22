@@ -4,10 +4,13 @@ An edit inside the body of a function that exists on the pinned commit takes
 effect only where an old statement around it runs: a modified or removed
 statement, or for an insertion the smallest old statement holding both of
 its neighbours, widened to the enclosing block when that statement compiles
-to no code. Those statements' line spans are returned. Any other edit
-(module or class level, a signature, a new function) is judged by the names
-it binds: PLAN_ALL when none is read by the code a TPC test runs after
-planning, else FULL.
+to no code. Those statements' line spans are returned. A signature edit
+that changes only plain default values takes effect only where the body
+runs, so it reaches the body. An edit inside the executor's `ENV` dict
+reaches the queries whose compiled code names a key whose entry it changes.
+Any other edit (module or class level, a signature, a new function) is
+judged by the names it binds: PLAN_ALL when none is read by the code a TPC
+test runs after planning, else FULL.
 """
 
 from __future__ import annotations
@@ -18,8 +21,14 @@ from dataclasses import dataclass, field
 from diffutil import Hunk
 
 PLAN_ALL, FULL = "plan", "full"
+ENV_PATH = "sqlglot/executor/env.py"
 Function = ast.FunctionDef | ast.AsyncFunctionDef
 _FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+# Default value nodes evaluated without calling code.
+_PLAIN = (
+    ast.Constant, ast.Name, ast.Attribute, ast.Tuple, ast.List, ast.Set, ast.Dict, ast.UnaryOp,
+    ast.Load, ast.unaryop,
+)
 
 
 @dataclass
@@ -29,27 +38,36 @@ class Reach:
     needs_probe: bool = False
     # The edited lines judged by name, each with the tree it is in: "old" (pinned) or "new" (patched).
     outside: list[tuple[str, int]] = field(default_factory=list)
+    # Keys of the executor's ENV whose entries the patch adds, removes or changes.
+    env_keys: set[str] = field(default_factory=set)
 
     def escalate(self, harmless: bool) -> None:
         self.level = FULL if not harmless or self.level == FULL else PLAN_ALL
 
 
-def file_reach(old_tree: ast.Module, new_tree: ast.Module, hunks: list[Hunk], names: set[str]) -> Reach:
+def file_reach(old_tree: ast.Module, new_tree: ast.Module, hunks: list[Hunk], names: set[str], path: str = "") -> Reach:
     reach = Reach()
-    old_functions = _functions(old_tree)
+    old_functions, new_functions = _functions(old_tree), _functions(new_tree)
+    env = _env_edit(old_tree, new_tree) if path == ENV_PATH else None
     for removed, added, before, after in _blocks(hunks):
         anchor = _anchor(old_tree, removed or [before, after], insertion=not removed)
         for line in removed:
             inside = _in_body(_chain(old_tree, line), line, old_functions)
-            if inside is not None:
+            if env is not None and _within(env[0], line):
+                reach.env_keys |= env[2]
+                reach.needs_probe = True
+            elif inside is not None:
                 reach.spans.append(_span(_widened(_chain(old_tree, line), inside[1])))
-            elif _outside_body(reach, _chain(old_tree, line), line, old_functions, names):
+            elif _outside_body(reach, _chain(old_tree, line), line, (old_functions, new_functions), names):
                 reach.outside.append(("old", line))
         for line in added:
             chain = _chain(new_tree, line)
             inside = _in_body(chain, line, old_functions)
-            if inside is None:
-                if _outside_body(reach, chain, line, old_functions, names):
+            if env is not None and _within(env[1], line):
+                reach.env_keys |= env[2]
+                reach.needs_probe = True
+            elif inside is None:
+                if _outside_body(reach, chain, line, (old_functions, new_functions), names):
                     reach.outside.append(("new", line))
             elif anchor is not None and anchor[2] == inside[0] and chain[-1].col_offset >= anchor[1]:
                 reach.spans.append(anchor[0])
@@ -197,8 +215,11 @@ def _anchor(old_tree: ast.Module, lines: list[int], insertion: bool) -> tuple[tu
     return (_span(statement), getattr(statement, "col_offset", function.body[0].col_offset), name)
 
 
-def _outside_body(reach: Reach, chain: list[ast.stmt], line: int, old_functions: dict[str, list[Function]], names: set[str]) -> bool:
+def _outside_body(
+    reach: Reach, chain: list[ast.stmt], line: int, functions: tuple[dict[str, list[Function]], dict[str, list[Function]]], names: set[str]
+) -> bool:
     """Judge an edit outside pinned function bodies by the names its statement binds; True when it escalated."""
+    old_functions, new_functions = functions
     reach.needs_probe = True
     function_indexes = [index for index, node in enumerate(chain) if isinstance(node, _FUNCTIONS)]
     existing = [index for index in function_indexes if _qualname(chain[: index + 1]) in old_functions]
@@ -208,7 +229,10 @@ def _outside_body(reach: Reach, chain: list[ast.stmt], line: int, old_functions:
     elif function_indexes:
         statement = chain[function_indexes[-1]]
         if line >= statement.lineno and not any(decorator.lineno <= line <= (decorator.end_lineno or 0) for decorator in statement.decorator_list):
-            reach.spans.extend(_span(function) for function in old_functions[_qualname(chain[: function_indexes[-1] + 1])])
+            qualname = _qualname(chain[: function_indexes[-1] + 1])
+            olds, news = old_functions[qualname], new_functions.get(qualname, [])
+            span = _body_span if len(olds) == len(news) == 1 and _defaults_only(olds[0], news[0]) else _span
+            reach.spans.extend(span(function) for function in olds)
             return False
     elif chain:
         statement = chain[-1]
@@ -219,6 +243,55 @@ def _outside_body(reach: Reach, chain: list[ast.stmt], line: int, old_functions:
     bound = _bound(statement)
     reach.escalate(bool(bound) and not any(name in names or name.startswith("__") for name in bound))
     return True
+
+
+def _defaults_only(old: Function, new: Function) -> bool:
+    """Whether two versions of a function have the same header but for default values that call no code."""
+    if type(old) is not type(new):
+        return False
+
+    def header(function: Function) -> list[str]:
+        args = function.args
+        shape = ast.arguments(
+            posonlyargs=args.posonlyargs, args=args.args, vararg=args.vararg, kwonlyargs=args.kwonlyargs,
+            kw_defaults=[ast.Constant(default is None) for default in args.kw_defaults], kwarg=args.kwarg,
+            defaults=[ast.Constant(None) for _ in args.defaults],
+        )
+        others = [*function.decorator_list, *function.type_params, function.returns or ast.Constant(None)]
+        return [ast.dump(node) for node in (shape, *others)]
+
+    defaults = [default for function in (old, new) for default in (*function.args.defaults, *function.args.kw_defaults) if default]
+    return header(old) == header(new) and all(isinstance(node, _PLAIN) for default in defaults for node in ast.walk(default))
+
+
+def _within(statement: ast.stmt, line: int) -> bool:
+    return statement.lineno <= line <= (statement.end_lineno or statement.lineno)
+
+
+def _env_edit(old_tree: ast.Module, new_tree: ast.Module) -> tuple[ast.stmt, ast.stmt, set[str]] | None:
+    """The `ENV = {...}` statements of both trees and the keys whose entries differ; None unless both are
+    one dict of distinct non-dunder string keys. The executor reads an entry only by its key."""
+    found = [_env_entries(tree) for tree in (old_tree, new_tree)]
+    if found[0] is None or found[1] is None:
+        return None
+    (old, old_entries), (new, new_entries) = found
+    changed = {key for key in old_entries.keys() | new_entries.keys() if old_entries.get(key) != new_entries.get(key)}
+    return (old, new, changed)
+
+
+def _env_entries(tree: ast.Module) -> tuple[ast.stmt, dict[str, str]] | None:
+    statements = [
+        statement
+        for statement in tree.body
+        if isinstance(statement, ast.Assign) and [ast.dump(target) for target in statement.targets] == [ast.dump(ast.Name("ENV", ast.Store()))]
+    ]
+    if len(statements) != 1 or not isinstance(statements[0].value, ast.Dict):
+        return None
+    value = statements[0].value
+    keys = [key.value for key in value.keys if isinstance(key, ast.Constant) and isinstance(key.value, str) and not key.value.startswith("__")]
+    if len(keys) != len(value.keys) or len(set(keys)) != len(keys):
+        return None
+    return (statements[0], {key: ast.dump(item) for key, item in zip(keys, value.values)})
 
 
 def _bound(node: ast.stmt) -> set[str]:
