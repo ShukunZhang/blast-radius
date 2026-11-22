@@ -274,6 +274,10 @@ class ClassUsers:
             via_dispatch |= proof[2]
         return readers, copiers, via_dispatch, bool(derived)
 
+    def tree(self, relative: str) -> ast.AST | None:
+        """The pinned file's tree, parsed once; callers must not change it."""
+        return self._tree(relative)
+
     def _tree(self, relative: str) -> ast.AST | None:
         if relative not in self._trees:
             try:

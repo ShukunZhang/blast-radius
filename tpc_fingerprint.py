@@ -13,24 +13,40 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import inspect
 import pickle
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 
 _LINKS = ("dependencies", "dependents")
+# The expression and plan step classes of the tree being digested, set as each digest starts.
+_KINDS: tuple[type, type] = (type(None), type(None))
+
+
+def _load_kinds() -> None:
+    global _KINDS
+    from sqlglot import exp
+    from sqlglot.planner import Step
+
+    _KINDS = (exp.Expr, Step)
+
+
+def _maybe(value: Any, seen: dict[Any, Any]) -> Any:
+    return "None" if value is None else _canon(value, seen)
 
 
 def _expr(value: Any, parent: Any, seen: dict[Any, Any]) -> Any:
     """An expression with every attribute the executor relies on, tree links checked by identity."""
-    from sqlglot import exp
+    expr_class = _KINDS[0]
 
     def child(item: Any, index: int | None, key: str) -> Any:
-        if isinstance(item, exp.Expr):
+        if isinstance(item, expr_class):
             links = (item.parent is value, item.arg_key == key, item.index == index)
             return (links, _expr(item, None, seen))
-        return _canon(item, seen)
+        return _maybe(item, seen)
 
     args = []
     for key, arg in sorted(value.args.items()):
@@ -42,10 +58,11 @@ def _expr(value: Any, parent: Any, seen: dict[Any, Any]) -> Any:
         type(value).__qualname__,
         args,
         None if parent is None else (type(parent).__qualname__, value.arg_key, value.index),
-        _canon(value.comments, seen),
-        _canon(value._type, seen),
-        _canon(value._meta, seen),
+        _maybe(value.comments, seen),
+        _maybe(value._type, seen),
+        _maybe(value._meta, seen),
         value._hash is None,
+        _maybe(getattr(value, "__dict__", None) or None, seen),
     )
 
 
@@ -71,18 +88,15 @@ def _step(value: Any, seen: dict[Any, Any]) -> Any:
 
 def _canon(value: Any, seen: dict[Any, Any]) -> Any:
     """A deterministic, structural rendering: sets are sorted and plan steps numbered once."""
-    from sqlglot import exp
-    from sqlglot.planner import Step
-
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return repr(value)
     if isinstance(value, enum.Enum):
         return f"{type(value).__qualname__}.{value.name}"
     if isinstance(value, type):
         return f"class {value.__module__}.{value.__qualname__}"
-    if isinstance(value, exp.Expr):
+    if isinstance(value, _KINDS[0]):
         return _expr(value, value.parent, seen)
-    if isinstance(value, Step):
+    if isinstance(value, _KINDS[1]):
         return _step(value, seen)
     if isinstance(value, dict):
         return ("dict", sorted((repr(_canon(key, seen)), _canon(item, seen)) for key, item in value.items()))
@@ -114,16 +128,39 @@ def _received(sql: str) -> Any:
     return pickle.loads(pickle.dumps(parse_one(sql)))
 
 
-def _plan(schema: dict, received: Any) -> str:
-    """What execute() derives before touching data: the tables named, the schema, the optimized query, the plan."""
+def _entering(rules: Sequence[Callable], enter: Callable[[int], None]) -> tuple[Callable, ...]:
+    """The rules, each calling enter(its 1-based position) first; optimize() still sees each rule's parameters."""
+
+    def entering(rule: Callable, position: int) -> Callable:
+        def wrapper(expression: Any, **kwargs: Any) -> Any:
+            enter(position)
+            return rule(expression, **kwargs)
+
+        wrapper.__signature__ = inspect.signature(rule)  # type: ignore[attr-defined]
+        return wrapper
+
+    return tuple(entering(rule, position) for position, rule in enumerate(rules, 1))
+
+
+def _plan(schema: dict, received: Any, enter: Callable[[int], None] | None = None) -> str:
+    """What execute() derives before touching data: the tables named, the schema, the optimized query, the plan.
+
+    `enter`, when given, is called with each optimizer rule's 1-based position
+    as the rule starts, then with POST before rendering and planning.
+    """
     from sqlglot import find_tables
     from sqlglot.optimizer import optimize
+    from sqlglot.optimizer.optimizer import RULES
     from sqlglot.planner import Plan
     from sqlglot.schema import ensure_schema
 
+    _load_kinds()
     names = sorted(table.name for table in find_tables(received))
     built = ensure_schema(schema, dialect=None)
-    optimized = optimize(received, built, leave_tables_isolated=True, dialect=None)
+    staged = {} if enter is None else {"rules": _entering(RULES, enter)}
+    optimized = optimize(received, built, leave_tables_isolated=True, dialect=None, **staged)
+    if enter is not None:
+        enter(POST)
     return _sha(
         [
             names,
@@ -135,7 +172,27 @@ def _plan(schema: dict, received: Any) -> str:
     )
 
 
-SKIP, CHECK, EXECUTE = 0, 1, 2
+def _stage(schema: dict, received: Any, rules: int) -> str:
+    """What execute() holds after its first `rules` optimizer rules: the tables named, the schema with the
+    caches rules fill for later ones (pickled, as plain data and types), and the query. Rules pass nothing
+    else on; optimize() hands each its arguments, so lines of optimizer.py count as POST."""
+    from sqlglot import find_tables
+    from sqlglot.optimizer import optimize
+    from sqlglot.optimizer.optimizer import RULES
+    from sqlglot.schema import ensure_schema
+
+    _load_kinds()
+    names = sorted(table.name for table in find_tables(received))
+    built = ensure_schema(schema, dialect=None)
+    staged = optimize(received, built, rules=RULES[:rules], leave_tables_isolated=True, dialect=None)
+    state = hashlib.sha256(pickle.dumps(vars(built), protocol=5)).hexdigest()
+    return _sha([names, state, _canon(staged, {})])
+
+
+# Actions per query. STAGED + k compares the query after its first k optimizer rules; the stage after the last
+# rule, rendering and planning, is POST.
+SKIP, CHECK, EXECUTE, STAGED = 0, 1, 2, 3
+POST = 15
 _SUITES = ("tpch", "tpcds")
 
 
@@ -206,9 +263,13 @@ def _result(table: Any) -> str:
 
 
 def record(suite: str) -> list[dict[str, Any] | None]:
-    """Per query: None when the test only ships it, else digests of its DuckDB SQL, plan and result, and their CPU."""
+    """Per query: None when the test only ships it, else digests of its DuckDB SQL, plan, stages and result, and
+    their CPU."""
     from sqlglot import transpile
+    from sqlglot.optimizer.optimizer import RULES
 
+    if len(RULES) + 1 != POST:
+        raise SystemExit(f"POST must be {len(RULES) + 1}")
     schema, pairs = _parts(suite)
     tables = _Tables(None, suite, schema)
     tables.ship_all()
@@ -223,6 +284,11 @@ def record(suite: str) -> list[dict[str, Any] | None]:
         middle = time.process_time()
         entry["result"] = _result(_execute(tables, received))
         entry["check_s"], entry["execute_s"] = round(middle - start, 3), round(time.process_time() - middle, 3)
+        entry["stages"], entry["stage_s"] = [], []
+        for rules in range(POST):
+            start = time.process_time()
+            entry["stages"].append(_stage(schema, _received(sql), rules))
+            entry["stage_s"].append(round(time.process_time() - start, 3))
         entries.append(entry)
     return entries
 
@@ -232,8 +298,9 @@ def replay(suite: str, expected: list, actions: list[int], full: bool, tables_pa
 
     Queries whose action is SKIP run no edited code. Every other query must
     parse and cross pickle, and an executed one must give DuckDB the same SQL.
-    Its result must then match the pinned one: taken as given for CHECK when
-    its plan digests the same, else by executing it. `full` also rebuilds and
+    Its result must then match the pinned one: taken as given for STAGED + k
+    when it digests the same after k optimizer rules, or for CHECK and STAGED
+    when its plan digests the same, else by executing it. `full` also rebuilds and
     ships every table, for edits to code setUpClass or the initializer runs.
     """
     try:
@@ -261,7 +328,9 @@ def replay(suite: str, expected: list, actions: list[int], full: bool, tables_pa
                 continue
             if _sha(transpile(sql, write="duckdb")) != entry["transpile"]:
                 return False
-            if action == CHECK and _plan(schema, _received(sql)) == entry["plan"]:
+            if action >= STAGED and _stage(schema, _received(sql), action - STAGED) == entry["stages"][action - STAGED]:
+                continue
+            if action != EXECUTE and _plan(schema, _received(sql)) == entry["plan"]:
                 continue
             if entry["result"] is None or _result(_execute(tables, received)) != entry["result"]:
                 return False

@@ -15,6 +15,7 @@ Coverage = dict[str, dict[int, set[int]]]
 _LINES: dict[ast.AST, dict[int, list[ast.AST]]] = {}
 _SCOPES: dict[ast.AST, tuple[list[ast.AST], list[ast.AST]]] = {}
 _CACHES: dict[ast.AST, tuple[dict[str, list[ast.AST]], set[ast.AST]]] = {}
+_KINDS: dict[tuple[ast.AST, type[ast.AST]], list[ast.AST]] = {}
 
 
 def nodes_at(tree: ast.AST, lineno: int) -> list[ast.AST]:
@@ -123,12 +124,19 @@ def dynamic_access(tree: ast.AST, lineno: int, name: str) -> bool:
     return False
 
 
+def nodes_of(tree: ast.AST, kind: type[ast.AST]) -> list[ast.AST]:
+    """Every node of one kind in the tree, collected once per tree and kind."""
+    key = (tree, kind)
+    if key not in _KINDS:
+        _KINDS[key] = [node for node in ast.walk(tree) if isinstance(node, kind)]
+    return _KINDS[key]
+
+
 def in_lambda_body(tree: ast.AST, lineno: int) -> bool:
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Lambda):
-            body = node.body
-            if body.lineno <= lineno <= (body.end_lineno or body.lineno):
-                return True
+    for node in nodes_of(tree, ast.Lambda):
+        body = node.body  # type: ignore[attr-defined]
+        if body.lineno <= lineno <= (body.end_lineno or body.lineno):
+            return True
     return False
 
 

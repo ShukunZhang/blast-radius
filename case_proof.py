@@ -28,7 +28,7 @@ from analyze import module_name
 from case_attrs import CaseCoverage, Mentions, arg_types_owner, attribute_cases, keys_of
 from class_users import ClassUsers
 from diffutil import DiffApplyError, FileDiff, apply_hunks, parse_patch
-from probe_small import _install_inline_pool, run_patched
+from probe_small import _install_inline_pool, run_patched, test_modules
 from tpc_edits import file_reach
 
 CASES_MAP = Path(os.environ.get("CASES_MAP", "/app/maps/cases.json"))
@@ -93,7 +93,7 @@ class CaseProof:
         modules = sorted(set().union(*(plan.modules for plan in chosen.values())))
         limit = 5.0 + 3.0 * sum(plan.cpu_s for plan in chosen.values())
         preload()
-        passing = run_patched(self.root, patch_text, lambda: replay(jobs, modules), limit)
+        passing = run_patched(self.root, patch_text, lambda: replay(jobs, modules), limit, test_modules(list(jobs)))
         if not isinstance(passing, list):
             return remaining
         return remaining - {number for number, plan in chosen.items() if plan.test_id in passing}

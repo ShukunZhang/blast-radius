@@ -97,10 +97,30 @@ class Warm:
             set(patched) & self._text_read
         )
 
+    def include(self, root: Path, names: tuple[str, ...]) -> bool:
+        """Import test modules into the warm parent too, so later warm children inherit them; True when that
+        changed what ran at import, which voids the swaps found so far."""
+        if not self.ready or all(name in sys.modules for name in names):
+            return False
+        before = len(self.ran)
+        self._load(root, tuple(name for name in names if name not in sys.modules))
+        if self.failed:
+            self.drop_owned()
+        self._swaps.clear()
+        return self.failed or len(self.ran) != before
+
     def _import(self, root: Path) -> bool:
         """Import WARM_MODULES once, recording every sqlglot function that runs meanwhile."""
         if self.ready or self.failed:
             return self.ready
+        self._load(root, WARM_MODULES)
+        self.ready = not self.failed
+        if self.failed:
+            self.drop_owned()
+        return self.ready
+
+    def _load(self, root: Path, names: tuple[str, ...]) -> None:
+        """Import names from the checkout, adding what they run and load to `ran` and `owned`."""
         prefix = str(root / "sqlglot") + os.sep
         ran = self.ran
         monitoring = sys.monitoring
@@ -120,9 +140,8 @@ class Warm:
             sys.path.insert(0, str(root))
             os.chdir(root)
             os.environ["SKIP_INTEGRATION"] = "0"
-            for name in WARM_MODULES:
+            for name in names:
                 importlib.import_module(name)
-            self.ready = True
         except Exception:  # noqa: BLE001 - a parent that cannot import stays cold
             self.failed = True
         finally:
@@ -135,10 +154,7 @@ class Warm:
                 os.environ.pop("SKIP_INTEGRATION", None)
             else:
                 os.environ["SKIP_INTEGRATION"] = saved[2]
-            self.owned = {name for name in set(sys.modules) - before if _under(sys.modules[name], root)}
-        if self.failed:
-            self.drop_owned()
-        return self.ready
+            self.owned |= {name for name in set(sys.modules) - before if _under(sys.modules[name], root)}
 
     def enter(self, root: Path, tree: Path, swaps: list[Swap] | None) -> None:
         """In the child: make the loaded modules behave as the patched tree, warm or cold."""

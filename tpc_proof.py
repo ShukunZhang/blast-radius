@@ -7,7 +7,8 @@ the lines each query runs while planned and while executed (tpc_queries),
 the lines every query shares, and the names the post-planning code reads.
 tpc_edits maps the patch onto those lines; the probe then skips queries that
 run no edited line, checks the plan of those that run one only while being
-planned, and executes the rest, comparing results with the pinned ones.
+planned (only as far as the last optimizer rule running one, when no later
+step does), and executes the rest, comparing results with the pinned ones.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from pathlib import Path
 from diffutil import DiffApplyError, FileDiff, apply_hunks, parse_patch
 from probe_small import run_patched
 from tpc_edits import FULL, PLAN_ALL, Reach, file_reach
-from tpc_fingerprint import CHECK, EXECUTE, SKIP
+from tpc_fingerprint import CHECK, EXECUTE, POST, SKIP, STAGED
 
 TESTS = {
     "tests/test_executor.py::TestExecutor::test_execute_tpch": "tpch",
@@ -90,6 +91,7 @@ class TpcProof:
         names = set(data["names"])
         full = plan_all = needs_probe = False
         plan_mask = run_mask = 0
+        last: dict[int, int] = {}
         for file_diff in files:
             path = file_diff.path or ""
             if file_diff.binary or (file_diff.old_path is not None and file_diff.new_path != file_diff.old_path):
@@ -112,17 +114,21 @@ class TpcProof:
             shared = self._shared_lines(suite).get(path, set())
             plan_lines = data["queries"]["plan"].get(path, {})
             run_lines = data["queries"]["run"].get(path, {})
+            stage_lines = data["queries"].get("stage", {}).get(path, {})
             for start, end in reach.spans:
                 for line in range(start, end + 1):
                     full |= line in shared
-                    plan_mask |= plan_lines.get(str(line), 0)
+                    hit = plan_lines.get(str(line), 0)
+                    plan_mask |= hit
                     run_mask |= run_lines.get(str(line), 0)
+                    if hit:
+                        _end_stages(last, hit, stage_lines.get(str(line), {}))
         actions = []
         for index, entry in enumerate(digests):
             if full or (run_mask >> index) & 1:
                 actions.append(EXECUTE if entry is not None else CHECK)
             elif plan_all or ((plan_mask >> index) & 1):
-                actions.append(CHECK)
+                actions.append(_check(entry, POST if plan_all else last.get(index, POST)))
             else:
                 actions.append(SKIP)
         needs_probe |= any(action != SKIP for action in actions)
@@ -142,6 +148,31 @@ class TpcProof:
         return self._shared[suite]
 
 
+def _end_stages(last: dict[int, int], hit: int, by_stage: dict[str, int]) -> None:
+    """Raise each hit query's last edited stage to this line's; POST where the line's stage is unknown."""
+    covered = 0
+    for stage, mask in by_stage.items():
+        covered |= mask
+        _raise_to(last, hit & mask, int(stage))
+    _raise_to(last, hit & ~covered, POST)
+
+
+def _raise_to(last: dict[int, int], mask: int, stage: int) -> None:
+    index = 0
+    while mask:
+        if mask & 1:
+            last[index] = max(last.get(index, 0), stage)
+        mask >>= 1
+        index += 1
+
+
+def _check(entry: dict | None, stage: int) -> int:
+    """The cheapest check of a query whose edited lines all end by `stage`."""
+    if entry is None or stage >= POST or entry.get("stages", [None] * POST)[stage] is None:
+        return CHECK
+    return STAGED + stage
+
+
 def _estimate(actions: list[int], full: bool, digests: list) -> float:
     """Expected CPU of a probe running these actions, risk of finding a break included."""
     cpu = PROBE_BASE_S + (ALL_TABLES_S if full else TABLES_S if EXECUTE in actions else 0.0)
@@ -153,6 +184,8 @@ def _estimate(actions: list[int], full: bool, digests: list) -> float:
             cpu += PARSE_S
         elif action == CHECK:
             cpu += entry["check_s"]
+        elif action >= STAGED:
+            cpu += entry["stage_s"][action - STAGED]
         else:
             executing += entry["execute_s"]
     return cpu + executing * (1 + EXECUTE_RISK)

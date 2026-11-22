@@ -293,7 +293,8 @@ def _stable(first: list, second: list, suite: str) -> list[dict[str, str | None]
             continue
         if (one["transpile"], one["plan"]) != (two["transpile"], two["plan"]):
             raise SystemExit(f"{suite} plans differ between runs")
-        merged.append({**one, "result": one["result"] if one["result"] == two["result"] else None})
+        stages = [first if first == second else None for first, second in zip(one["stages"], two["stages"], strict=True)]
+        merged.append({**one, "result": one["result"] if one["result"] == two["result"] else None, "stages": stages})
     return merged
 
 

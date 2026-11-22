@@ -7,11 +7,14 @@ Anything slow, failed, or inconclusive stays selected.
 
 from __future__ import annotations
 
+import gc
 import importlib
 import os
+import select
 import signal
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -105,7 +108,11 @@ def _install_inline_pool() -> None:
         def shutdown(self, *_args: object, **_kwargs: object) -> None:
             return None
 
+    original = concurrent.futures.ProcessPoolExecutor
     concurrent.futures.ProcessPoolExecutor = InlineExecutor  # type: ignore[misc]
+    for name, module in list(sys.modules.items()):
+        if name.startswith("tests") and getattr(module, "ProcessPoolExecutor", None) is original:
+            module.ProcessPoolExecutor = InlineExecutor  # type: ignore[attr-defined]
 
 
 def _keep_failing(catalog: list[dict], numbers: set[int]) -> set[int]:
@@ -147,19 +154,35 @@ def _keep_failing(catalog: list[dict], numbers: set[int]) -> set[int]:
     return keep
 
 
-def run_patched(root: Path, patch_text: str, job: Callable[[], object], limit_s: float) -> object | None:
-    """Run job in a child that imports the patched tree. None when it fails or overruns."""
+def test_modules(test_ids: list[str]) -> tuple[str, ...]:
+    return tuple(sorted({test_id.split("::")[0][:-3].replace("/", ".") for test_id in test_ids}))
+
+
+def run_patched(
+    root: Path, patch_text: str, job: Callable[[], object], limit_s: float, modules: tuple[str, ...] = ()
+) -> object | None:
+    """Run job in a child that imports the patched tree. None when it fails or overruns.
+
+    A warm child inherits `modules` (the test modules the job imports) from the parent, which imports them once.
+    """
     import json
 
     patched = _apply(root, patch_text)
     swaps = WARM.swaps(root, patched) if _modifies_only(patch_text) else None
+    if swaps is not None and WARM.include(root, modules):
+        swaps = WARM.swaps(root, patched)
     with tempfile.TemporaryDirectory(prefix="probe-") as folder:
         tree = Path(folder) / "tree"
         tree.mkdir()
         _overlay(root, tree, patched)
         result_path = Path(folder) / "result.json"
+        # Frozen, the parent's objects stay out of the child's collections, which would otherwise scan
+        # (and copy) all of them.
+        gc.freeze()
         pid = os.fork()
-        if pid == 0:
+        if pid:
+            gc.unfreeze()
+        else:
             try:
                 with open(os.devnull, "w") as silence:
                     os.dup2(silence.fileno(), 1)
@@ -173,16 +196,12 @@ def run_patched(root: Path, patch_text: str, job: Callable[[], object], limit_s:
                 os._exit(0)
             except BaseException:
                 os._exit(1)
-        deadline = __import__("time").monotonic() + limit_s
-        while not os.waitpid(pid, os.WNOHANG)[0]:
-            if __import__("time").monotonic() >= deadline:
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-                break
-            __import__("time").sleep(0.01)
+        if not _reaped(pid, limit_s):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
         if not result_path.exists():
             return None
         try:
@@ -191,10 +210,35 @@ def run_patched(root: Path, patch_text: str, job: Callable[[], object], limit_s:
             return None
 
 
+def _reaped(pid: int, limit_s: float) -> bool:
+    """Whether the child exited within limit_s, reaped if so; sleeps on a pidfd where the kernel has them."""
+    deadline = time.monotonic() + limit_s
+    try:
+        handle = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        handle = None
+    if handle is not None:
+        try:
+            select.select([handle], [], [], limit_s)
+        finally:
+            os.close(handle)
+        return bool(os.waitpid(pid, os.WNOHANG)[0])
+    while not os.waitpid(pid, os.WNOHANG)[0]:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
 def confirm(root: Path, patch_text: str, catalog: list[dict], selected: set[int]) -> set[int]:
     """Return selected with confirmed passes removed. A dead child keeps them all."""
+    ids = [test["id"] for test in catalog if test["number"] in selected]
     keep = run_patched(
-        root, patch_text, lambda: sorted(_keep_failing(catalog, selected)), 8.0 + ALARM_S * len(selected)
+        root,
+        patch_text,
+        lambda: sorted(_keep_failing(catalog, selected)),
+        8.0 + ALARM_S * len(selected),
+        test_modules(ids),
     )
     if not isinstance(keep, list):
         return selected

@@ -35,7 +35,7 @@ from edits import (
     neutral_identity,
     proven_readers,
 )
-from class_reads import changed_dict_keys
+from class_reads import changed_dict_keys, nodes_of, scopes
 from class_users import ClassUsers
 from helper_edits import changed_helper_names, dependent_files
 from pack import pack
@@ -259,7 +259,7 @@ class Selector:
             new_tree = ast.parse(patched)
         except SyntaxError:
             return self.importers_of(path) | tests_touching(self.coverage, path)
-        old_tree = ast.parse(original)
+        old_tree = self.class_users.tree(file_diff.old_path or path) or ast.parse(original)
         # `<`/`<=` on dialect.version versus a tuple that cannot be equal to it
         # takes the same branch for every version this constructor stores.
         # `is`/`==` is not in that set: equal objects that are not the same
@@ -283,11 +283,11 @@ class Selector:
     def _old_line(
         self, path: str, tree: ast.AST, line: int, narrow: bool, renamed_keys: set[str] | None = None
     ) -> set[int]:
-        functions, classes = functions_and_classes(tree)
+        functions, classes = scopes(tree)
         # Calling a lambda executes its body. Tests that only imported the class
         # ran the header and did not see a value change inside the body.
         if narrow:
-            lambda_node = tightest([node for node in ast.walk(tree) if isinstance(node, ast.Lambda)], line)
+            lambda_node = tightest(nodes_of(tree, ast.Lambda), line)
             if lambda_node is not None:
                 start = lambda_node.lineno + 1 if line > lambda_node.lineno else line
                 selected = tests_on_lines(self.coverage, path, start, _end(lambda_node))
@@ -304,7 +304,7 @@ class Selector:
             # An and/or is only observed by tests that entered that expression.
             # On the sample every failing test of such an edit is in this set;
             # tests that only ran another branch of the function are not.
-            boolop = tightest([node for node in ast.walk(tree) if isinstance(node, ast.BoolOp)], line)
+            boolop = tightest(nodes_of(tree, ast.BoolOp), line)
             if boolop is not None:
                 owners = tests_on_lines(self.coverage, path, boolop.lineno, _end(boolop))
                 if owners:
@@ -498,7 +498,7 @@ class Selector:
 
     def _insertion(self, path: str, old_tree: ast.AST, new_tree: ast.AST, lines: list[int]) -> set[int]:
         selected: set[int] = set()
-        old_functions, old_classes = functions_and_classes(old_tree)
+        old_functions, old_classes = scopes(old_tree)
         new_functions, new_classes = functions_and_classes(new_tree)
         for line in lines:
             function = tightest(new_functions, line)
